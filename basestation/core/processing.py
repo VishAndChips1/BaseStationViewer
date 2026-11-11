@@ -53,19 +53,26 @@ class Pipeline:
         """Indices of surviving points, or None when nothing is filtered."""
         if not self.active or len(xyz) == 0:
             return None
-        idx = np.arange(len(xyz))
 
-        if self.range_enabled:
+        # NaN/inf coordinates cannot be binned, boxed or ranged; they would
+        # become garbage voxel keys. Frames are already cleaned on parse, but
+        # this keeps the pipeline safe on its own.
+        finite = np.isfinite(xyz).all(axis=1)
+        idx = np.arange(len(xyz)) if finite.all() else np.flatnonzero(finite)
+
+        if self.range_enabled and len(idx):
+            lo, hi = sorted((self.range_min, self.range_max))
             dist = np.linalg.norm(xyz[idx], axis=1)
-            idx = idx[(dist >= self.range_min) & (dist <= self.range_max)]
+            idx = idx[(dist >= lo) & (dist <= hi)]
 
         if self.crop.enabled and len(idx):
             idx = idx[inside_box(xyz[idx], self.crop.bounds) == self.crop.keep_inside]
 
         if self.thermal_enabled and len(idx):
+            lo, hi = sorted((self.thermal_min, self.thermal_max))
             t = temp_c[idx]
-            known = ~np.isnan(t)
-            in_band = known & (t >= self.thermal_min) & (t <= self.thermal_max)
+            known = np.isfinite(t)
+            in_band = known & (t >= lo) & (t <= hi)
             idx = idx[in_band if self.thermal_drop_unknown else (in_band | ~known)]
 
         if self.isolated_enabled and len(idx):
@@ -81,17 +88,31 @@ class Pipeline:
 # -- filters --------------------------------------------------------------
 
 def inside_box(xyz: np.ndarray, bounds) -> np.ndarray:
-    x0, x1, y0, y1, z0, z1 = bounds
+    x0, x1 = sorted((bounds[0], bounds[1]))
+    y0, y1 = sorted((bounds[2], bounds[3]))
+    z0, z1 = sorted((bounds[4], bounds[5]))
     return ((xyz[:, 0] >= x0) & (xyz[:, 0] <= x1) &
             (xyz[:, 1] >= y0) & (xyz[:, 1] <= y1) &
             (xyz[:, 2] >= z0) & (xyz[:, 2] <= z1))
 
 
+_MAX_CELLS = (1 << 21) - 8      # per-axis cell count that still fits 21 bits
+
+
+def _fit_cell(xyz: np.ndarray, size: float) -> float:
+    """Cell edge to use: `size`, enlarged only if the cloud is so wide that
+    the per-axis index would overflow 21 bits (e.g. 5 mm cells over 20 km).
+    The old code clamped instead, silently merging distant points."""
+    extent = float((xyz.max(axis=0) - xyz.min(axis=0)).max())
+    return max(size, 1e-6, extent / _MAX_CELLS)
+
+
 def _voxel_keys(xyz: np.ndarray, size: float) -> np.ndarray:
     """One int64 per point identifying its voxel (21 bits per axis)."""
-    cells = np.floor(xyz / max(size, 1e-6)).astype(np.int64)
+    # Absolute grid (floor of the raw coordinate), so a voxel sits at the same
+    # place from frame to frame; only the *indices* are shifted to start at 0.
+    cells = np.floor(xyz / _fit_cell(xyz, size)).astype(np.int64)
     cells -= cells.min(axis=0)
-    cells = np.minimum(cells, (1 << 21) - 2)
     return (cells[:, 0] << 42) | (cells[:, 1] << 21) | cells[:, 2]
 
 
@@ -109,11 +130,10 @@ def neighbor_counts(xyz: np.ndarray, radius: float) -> np.ndarray:
     generous neighbourhood (up to ~1.7 x radius) but needs no KD-tree and
     stays linear-ish in point count -- fine for removing stray returns.
     """
-    cell = max(radius, 1e-6)
+    cell = _fit_cell(xyz, radius)
     cells = np.floor(xyz / cell).astype(np.int64)
     cells -= cells.min(axis=0)
     cells += 1                                    # room for the -1 neighbour
-    cells = np.minimum(cells, (1 << 21) - 3)
     keys = (cells[:, 0] << 42) | (cells[:, 1] << 21) | cells[:, 2]
     uniq, counts = np.unique(keys, return_counts=True)
 
@@ -162,9 +182,12 @@ def polygon_area_xy(points) -> float:
 
 
 def bounds_of(xyz: np.ndarray):
-    """(xmin, xmax, ymin, ymax, zmin, zmax) of a cloud, or None if empty."""
+    """(xmin, xmax, ymin, ymax, zmin, zmax) of the finite points, or None."""
     if len(xyz) == 0:
         return None
-    lo, hi = xyz.min(axis=0), xyz.max(axis=0)
+    finite = xyz[np.isfinite(xyz).all(axis=1)]
+    if len(finite) == 0:
+        return None
+    lo, hi = finite.min(axis=0), finite.max(axis=0)
     return (float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1]),
             float(lo[2]), float(hi[2]))

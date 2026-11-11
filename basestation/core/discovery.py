@@ -9,6 +9,7 @@ validated against Content-Length, so scanning a subnet stays cheap even when
 frames are megabytes.
 """
 
+import http.client
 import ipaddress
 import os
 import socket
@@ -16,9 +17,13 @@ import struct
 import subprocess
 import urllib.error
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 
-from basestation.core.protocol import POINT_DTYPE
+from basestation.core.netutil import http_url
+from basestation.core.protocol import (
+    POINT_DTYPE, RIG_HEADER, RIG_POINT_DTYPE, is_gzip,
+)
 
 PROBE_TIMEOUT = 0.6
 MAX_SUBNETS = 3
@@ -75,26 +80,57 @@ def wsl_hosts() -> list[str]:
     return hosts
 
 
+def _plausible_rig_header(head: bytes) -> int | None:
+    """Point count if `head` (>= 24 bytes) is a sane rig-layout header."""
+    if len(head) < RIG_HEADER.size:
+        return None
+    n, _seq, ox, oy, oz, scale = RIG_HEADER.unpack_from(head, 0)
+    if n > PLAUSIBLE_MAX_POINTS:
+        return None
+    if n and not (all(map(_finite, (ox, oy, oz, scale))) and scale > 0):
+        return None
+    return n
+
+
+def _finite(x: float) -> bool:
+    return x == x and x not in (float("inf"), float("-inf"))
+
+
 def probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> int | None:
-    """Return the sender's point count, or None if this isn't a sender."""
-    url = f"http://{host}:{port}/latest.bin"
+    """Return the sender's point count, or None if this isn't a sender.
+
+    Only the start of the body is read, so scanning a subnet stays cheap even
+    when frames are megabytes. Two layouts are recognised (see protocol.py):
+    the plain float32 one (point count checked against Content-Length) and the
+    rig's quantized one, which is normally gzip-compressed -- there the first
+    bytes are inflated and the header sanity-checked.
+    """
+    url = http_url(host, port, "/latest.bin")
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             if resp.status != 200:
                 return None
-            head = resp.read(4)
+            head = resp.read(4096)
             if len(head) < 4:
                 return None
-            (num_points,) = struct.unpack("<I", head)
+            if is_gzip(head):
+                inflated = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(head, 64)
+                return _plausible_rig_header(inflated)
+            (num_points,) = struct.unpack("<I", head[:4])
             if num_points > PLAUSIBLE_MAX_POINTS:
                 return None
             declared = resp.headers.get("Content-Length")
             if declared is not None:
-                expected = 4 + num_points * POINT_DTYPE.itemsize
-                if int(declared) != expected:
-                    return None
+                size = int(declared)
+                if size == 4 + num_points * POINT_DTYPE.itemsize:
+                    return num_points
+                if size == RIG_HEADER.size + num_points * RIG_POINT_DTYPE.itemsize \
+                        and _plausible_rig_header(head) == num_points:
+                    return num_points
+                return None
             return num_points
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError, zlib.error,
+            http.client.HTTPException):
         return None
 
 

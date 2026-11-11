@@ -13,11 +13,17 @@ fields are kept and shown generically, missing ones are skipped.
 No Qt imports: this is plain Python and unit-testable.
 """
 
+import http.client
 import json
+import math
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+
+from basestation.core.netutil import http_url, read_body
+
+MAX_REPORT_BYTES = 1_000_000
 
 OK, WARN, ERROR, UNKNOWN = "ok", "warn", "error", "unknown"
 _SEVERITY = {UNKNOWN: 0, OK: 1, WARN: 2, ERROR: 3}
@@ -55,9 +61,12 @@ def worst(statuses) -> str:
 
 
 def _num(value):
+    """A real, finite number -- or None. NaN/inf/bool are not measurements: a
+    NaN fps would compare False against every threshold and grade as healthy."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    value = float(value)
+    return value if math.isfinite(value) else None
 
 
 @dataclass
@@ -260,18 +269,19 @@ class FetchResult:
 
 
 def fetch(host: str, port: int, timeout: float = 3.0) -> FetchResult:
-    url = f"http://{host}:{port}/diagnostics"
+    url = http_url(host, port, "/diagnostics")
     start = time.time()
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
-            body = resp.read()
+            body = read_body(resp, MAX_REPORT_BYTES)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return FetchResult(
                 "unsupported",
                 detail="The sensor PC is reachable but does not serve /diagnostics yet.")
         return FetchResult("unreachable", detail=f"HTTP {exc.code} from sensor PC")
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+    except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException,
+            ValueError) as exc:
         reason = str(getattr(exc, "reason", exc))
         if "refused" in reason.lower():
             reason = "Connection refused - is the rover server running?"
@@ -279,7 +289,9 @@ def fetch(host: str, port: int, timeout: float = 3.0) -> FetchResult:
             reason = "Timed out - sensor PC not answering"
         return FetchResult("unreachable", detail=reason[:100])
     latency = time.time() - start
+    if len(body) > MAX_REPORT_BYTES:
+        return FetchResult("bad", detail="Diagnostics reply is implausibly large")
     try:
         return FetchResult("ok", parse_report(json.loads(body), latency))
-    except ValueError as exc:   # includes json.JSONDecodeError
+    except (ValueError, RecursionError) as exc:   # ValueError includes JSONDecodeError
         return FetchResult("bad", detail=f"Unreadable diagnostics: {exc}"[:100])

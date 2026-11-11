@@ -23,6 +23,9 @@ from basestation.ui import widgets
 from basestation.core.diagnostics import ERROR, OK, UNKNOWN, WARN
 
 POLL_SECONDS = 1.0
+# Workers still inside a network call when their dialog closed. Python must not
+# destroy a running QThread (hard crash), so they wait here until they finish.
+_RETIRED: list = []
 
 
 def _color(status: str) -> str:
@@ -48,7 +51,11 @@ class DiagnosticsWorker(QThread):
     def run(self) -> None:
         while not self._stop_event.is_set():
             started = time.time()
-            self.result.emit(diagnostics.fetch(self._host, self._port))
+            try:
+                self.result.emit(diagnostics.fetch(self._host, self._port))
+            except Exception as exc:             # a bad poll must not end the loop
+                self.result.emit(diagnostics.FetchResult(
+                    "unreachable", detail=f"Unexpected error: {exc!r}"[:90]))
             self._stop_event.wait(max(0.0, POLL_SECONDS - (time.time() - started)))
 
 
@@ -80,7 +87,9 @@ def _row(caption: str, value: str, status: str | None = None) -> QWidget:
 
 
 def _fmt_age(age) -> str:
-    return "-" if age is None else f"{age:.1f} s ago"
+    if age is None:
+        return "-"
+    return "just now" if age < 1.0 else f"{age:.0f} s ago"
 
 
 class _ItemCard(QFrame):
@@ -166,6 +175,18 @@ class DiagnosticsDialog(QDialog):
         self._body.setContentsMargins(0, 0, theme.SPACE_2, 0)
         self._body.setSpacing(theme.SPACE_3)
         scroll.setWidget(self._content)
+        self._scroll = scroll
+        # Scroll-position bookkeeping, see _render().
+        self._restore_to = None
+        self._restore_timer = QTimer(self)
+        self._restore_timer.setSingleShot(True)
+        self._restore_timer.setInterval(250)
+        self._restore_timer.timeout.connect(lambda: setattr(self, "_restore_to", None))
+        bar = scroll.verticalScrollBar()
+        bar.rangeChanged.connect(self._on_scroll_range_changed)
+        # actionTriggered fires for the user's wheel / drag / arrows, not for
+        # our own setValue(): the moment the user scrolls, stop restoring.
+        bar.actionTriggered.connect(lambda _a: setattr(self, "_restore_to", None))
         outer.addWidget(scroll, 1)
 
         close = QPushButton("Close")
@@ -194,8 +215,12 @@ class DiagnosticsDialog(QDialog):
         self._worker.start()
 
     def _shutdown_worker(self) -> None:
-        self._worker.stop()
-        self._worker.wait(4000)
+        worker = self._worker
+        worker.stop()
+        if not worker.wait(1500):
+            _RETIRED.append(worker)
+            worker.finished.connect(
+                lambda w=worker: _RETIRED.remove(w) if w in _RETIRED else None)
 
     def closeEvent(self, event):
         self._tick.stop()
@@ -215,13 +240,44 @@ class DiagnosticsDialog(QDialog):
     def _clear(self) -> None:
         while self._body.count():
             item = self._body.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            widget = item.widget()
+            if widget is not None:
+                # Detach NOW. deleteLater() alone leaves the old row parented to
+                # the scroll content until the event loop runs, so the content
+                # height (and with it the scroll range) is wrong in between.
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
 
     def _section(self, icon_name: str, title: str) -> None:
         self._body.addWidget(widgets.SectionHeader(icon_name, title))
 
+    def _on_scroll_range_changed(self, _lo: int, hi: int) -> None:
+        want = self._restore_to
+        bar = self._scroll.verticalScrollBar()
+        if want is not None and hi >= want and bar.value() != want:
+            bar.setValue(want)
+
     def _render(self) -> None:
+        # The whole body is rebuilt on every tick. Rebuilding makes the scroll
+        # RANGE collapse to 0 and regrow a moment later (on a later event pass),
+        # and the collapse clamps the position to the top -- so the window could
+        # never be scrolled. Remember where the user was, and put them back as
+        # soon as the range is large enough again (see _on_scroll_range_changed).
+        bar = self._scroll.verticalScrollBar()
+        keep = self._restore_to if self._restore_to is not None else bar.value()
+        self._restore_to = keep
+        self._restore_timer.start()
+        self._content.setUpdatesEnabled(False)
+        try:
+            self._render_body()
+            self._body.activate()
+        finally:
+            self._content.setUpdatesEnabled(True)
+        if bar.maximum() >= keep:
+            bar.setValue(keep)
+
+    def _render_body(self) -> None:
         self._clear()
         result = self._last
         report = result.report if result and result.kind == "ok" else None

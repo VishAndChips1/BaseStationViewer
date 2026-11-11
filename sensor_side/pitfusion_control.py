@@ -111,9 +111,27 @@ def _after(delay, fn):
     t.start()
 
 
-def make_handler(token_loader, runner=run, schedule=None):
+SHUTDOWN_CHECK_TTL = 60.0
+
+
+def make_handler(token_loader, runner=run, schedule=None, clock=time.monotonic):
+    # `sudo -n -l` is a process spawn. The base station polls /status every
+    # second or two, so asking on every poll burned CPU (and battery) on the Pi
+    # for an answer that almost never changes. Ask at most once a minute.
+    shutdown_cache = {"value": False, "at": None}
+
+    def cached_can_shutdown() -> bool:
+        now = clock()
+        if shutdown_cache["at"] is None or now - shutdown_cache["at"] >= SHUTDOWN_CHECK_TTL:
+            shutdown_cache["value"] = can_shutdown(runner)
+            shutdown_cache["at"] = now
+        return shutdown_cache["value"]
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Drop a keep-alive connection that goes quiet instead of holding its
+        # thread forever (a laptop that slept, a dropped WiFi client).
+        timeout = 15
 
         def log_message(self, fmt, *args):
             pass
@@ -133,7 +151,7 @@ def make_handler(token_loader, runner=run, schedule=None):
             st = pipeline_status(runner)
             st.update({"hostname": socket.gethostname(),
                        "control": "enabled" if token_loader() else "disabled",
-                       "can_shutdown": can_shutdown(runner)})
+                       "can_shutdown": cached_can_shutdown()})
             self._json(200, st)
 
         def do_POST(self):

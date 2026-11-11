@@ -1,6 +1,7 @@
 """Networking and recording: polling the rover, scanning for senders, and
 saving frames. Qt threads only -- no widgets are touched from here."""
 
+import http.client
 import threading
 import time
 import urllib.error
@@ -15,6 +16,7 @@ from basestation.core.protocol import MalformedFrameError, parse_frame
 # Generous by default: over real WiFi a full-resolution frame can be several
 # MB, and a tight timeout would fail every request on a marginal link.
 DEFAULT_FETCH_TIMEOUT = 10.0
+MAX_BODY_BYTES = 512 * 1024 * 1024    # refuse an absurd response rather than exhaust memory
 
 
 
@@ -80,15 +82,33 @@ class NetworkStats:
             }
 
 
+class _NotModified(Exception):
+    """The server answered 304: the frame has not changed since the last fetch."""
+
+
+class _Stopped(Exception):
+    """stop() was called while a download was in progress."""
+
+
 class PollWorker(QThread):
     """Polls the rover endpoint on a background thread.
 
-    Frames are handed to the GUI thread through a queued Qt signal, so no
-    GUI object is ever touched from here.
+    Frames do NOT travel through the signal queue. The worker keeps only the
+    newest frame in a one-slot mailbox and emits a bare `frame_ready` when the
+    slot goes from empty to full; the GUI calls take_frame(). If the GUI is
+    slower than the network (a heavy filter, a big cloud) frames are dropped
+    instead of piling up in an unbounded queue -- which at several MB a frame
+    used to grow memory and lag without limit.
+
+    The thread never dies silently: every failure becomes an "error" state and
+    a retry with growing back-off, including dropped connections mid-body
+    (http.client.IncompleteRead is not an OSError) and anything unexpected.
     """
 
-    frame_ready = Signal(object)
+    frame_ready = Signal()
     state_changed = Signal(str, str)  # state ("live"/"connecting"/"error"), detail
+
+    MAX_BACKOFF = 2.0
 
     def __init__(self, url: str, poll_interval: float, stats: NetworkStats,
                  timeout: float = DEFAULT_FETCH_TIMEOUT):
@@ -99,9 +119,34 @@ class PollWorker(QThread):
         self._stats = stats
         self._stop_event = threading.Event()
         self._last_state = None
+        self._lock = threading.Lock()
+        self._latest = None
+        self._signalled = False
+        self._etag = None
+
+    # -- called from the GUI thread ----------------------------------------
+
+    def take_frame(self):
+        """The newest unconsumed frame, or None."""
+        with self._lock:
+            frame, self._latest, self._signalled = self._latest, None, False
+        return frame
 
     def stop(self) -> None:
+        """Ask the thread to finish. A download in progress notices within
+        ~0.5 s (see _read_body); only the connect phase has to run out its
+        timeout, which is why callers retire a worker that is slow to stop."""
         self._stop_event.set()
+
+    # -- worker thread ------------------------------------------------------
+
+    def _post(self, frame) -> None:
+        with self._lock:
+            self._latest = frame            # a newer frame replaces an unconsumed one
+            notify = not self._signalled
+            self._signalled = True
+        if notify:
+            self.frame_ready.emit()
 
     def _emit_state(self, state: str, detail: str) -> None:
         # Only emit on change, so the GUI isn't spammed while idling.
@@ -109,48 +154,121 @@ class PollWorker(QThread):
             self._last_state = (state, detail)
             self.state_changed.emit(state, detail)
 
+    def _fetch(self) -> bytes:
+        headers = {"Accept-Encoding": "gzip"}
+        if self._etag:
+            headers["If-None-Match"] = self._etag      # lets the rig answer 304
+        req = urllib.request.Request(self._url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                data = self._read_body(resp)
+                self._etag = resp.headers.get("ETag") or self._etag
+        except urllib.error.HTTPError as exc:
+            if exc.code == 304:
+                raise _NotModified() from None
+            raise
+        return data
+
+    def _read_body(self, resp) -> bytes:
+        """Read the body in short slices so stop() is honoured within ~0.5 s.
+
+        (Cutting the socket from another thread does not wake a blocked recv()
+        on Windows, so the reader wakes itself instead.) read1() is used rather
+        than read(n): on a timeout it has consumed nothing, so no bytes are lost.
+        """
+        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            try:
+                sock.settimeout(0.5)
+            except OSError:
+                sock = None
+        declared = resp.headers.get("Content-Length")
+        chunks, total, last_progress = [], 0, time.time()
+        while True:
+            if self._stop_event.is_set():
+                raise _Stopped()
+            try:
+                chunk = resp.read1(1 << 16)
+            except TimeoutError:
+                if sock is None:
+                    raise
+                if time.time() - last_progress > self._timeout:
+                    raise TimeoutError("timed out waiting for the rest of the frame") from None
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            last_progress = time.time()
+            if total > MAX_BODY_BYTES:
+                raise MalformedFrameError("response is implausibly large")
+        data = b"".join(chunks)
+        if declared and declared.isdigit() and len(data) < int(declared):
+            raise http.client.IncompleteRead(data, int(declared) - len(data))
+        return data
+
+    def _rest(self, started: float, failures: int) -> None:
+        wait = self._poll_interval - (time.time() - started)
+        if failures:
+            # Back off while the link is down instead of hammering it.
+            wait = max(wait, min(self._poll_interval * (2 ** min(failures, 6)), self.MAX_BACKOFF))
+        if wait > 0:
+            self._stop_event.wait(wait)
+
     def run(self) -> None:
         frame_id = 0
+        failures = 0
         self._emit_state("connecting", "Connecting...")
 
         while not self._stop_event.is_set():
             start = time.time()
             try:
-                with urllib.request.urlopen(self._url, timeout=self._timeout) as resp:
-                    data = resp.read()
-            except urllib.error.HTTPError as exc:
-                self._stats.record_failure()
-                self._emit_state("error", f"HTTP {exc.code} from server")
-                self._stop_event.wait(self._poll_interval)
-                continue
-            except (urllib.error.URLError, OSError, TimeoutError) as exc:
-                self._stats.record_failure()
-                self._emit_state("error", self._describe_error(exc))
-                self._stop_event.wait(self._poll_interval)
-                continue
-
-            recv_time = time.time()
-            fetch_seconds = recv_time - start
-
-            try:
+                data = self._fetch()
+                recv_time = time.time()
+                fetch_seconds = recv_time - start
                 frame = parse_frame(data, frame_id, recv_time, fetch_seconds)
-            except MalformedFrameError as exc:
-                self._stats.record_failure()
-                self._emit_state("error", f"Bad frame: {exc}")
-                self._stop_event.wait(self._poll_interval)
+            except _Stopped:
+                break
+            except _NotModified:
+                failures = 0                 # reachable, simply nothing new yet
+                self._rest(start, 0)
                 continue
+            except urllib.error.HTTPError as exc:
+                failures += 1
+                self._fail(f"HTTP {exc.code} from server")
+            except MalformedFrameError as exc:
+                failures += 1
+                self._etag = None            # don't ask "unchanged?" about a bad frame
+                self._fail(f"Bad frame: {exc}"[:90])
+            except (urllib.error.URLError, OSError, TimeoutError,
+                    http.client.HTTPException, ValueError) as exc:
+                if self._stop_event.is_set():
+                    break                    # stop() closed the socket: not an error
+                failures += 1
+                self._fail(self._describe_error(exc))
+            except Exception as exc:         # last resort: never die silently
+                failures += 1
+                self._fail(f"Unexpected error: {exc!r}"[:90])
+            else:
+                failures = 0
+                frame_id += 1
+                self._stats.record_frame(len(data), frame.num_points, fetch_seconds)
+                self._emit_state("live", f"Live - {frame.num_points:,} points")
+                self._post(frame)
+            self._rest(start, failures)
 
-            frame_id += 1
-            self._stats.record_frame(len(data), frame.num_points, fetch_seconds)
-            self._emit_state("live", f"Live - {frame.num_points:,} points")
-            self.frame_ready.emit(frame)
-
-            elapsed = time.time() - start
-            if elapsed < self._poll_interval:
-                self._stop_event.wait(self._poll_interval - elapsed)
+    def _fail(self, detail: str) -> None:
+        self._stats.record_failure()
+        self._emit_state("error", detail)
 
     @staticmethod
     def _describe_error(exc: Exception) -> str:
+        if isinstance(exc, http.client.IncompleteRead):
+            return "Connection dropped mid-frame - weak WiFi?"
+        if isinstance(exc, http.client.RemoteDisconnected):
+            return "The rover closed the connection"
+        if isinstance(exc, ValueError):
+            return "That address can't be used as a rover URL"
         reason = getattr(exc, "reason", exc)
         text = str(reason)
         if "refused" in text.lower():
@@ -283,7 +401,12 @@ class ControlWorker(QThread):
             with self._lock:
                 target = self._target
             if target is not None:
-                self.status.emit(control.get_status(*target))
+                try:
+                    st = control.get_status(*target)
+                    st.target = target       # lets the GUI discard a late reply for an old host
+                    self.status.emit(st)
+                except Exception:            # a bad poll must not end the loop
+                    pass
             self._wake.wait(self.FAST if self._fast else self.SLOW)
             self._wake.clear()
 
@@ -298,5 +421,8 @@ class ActionWorker(QThread):
         self._args = (host, port, action, token)
 
     def run(self) -> None:
-        ok, message = control.send_action(*self._args)
+        try:
+            ok, message = control.send_action(*self._args)
+        except Exception as exc:             # always report back, or the UI waits forever
+            ok, message = False, f"Unexpected error: {exc!r}"[:90]
         self.done.emit(self._args[2], ok, message)

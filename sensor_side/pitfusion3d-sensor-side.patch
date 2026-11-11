@@ -11,7 +11,7 @@ index e7267e2..d17ef5e 100644
  )
  
 diff --git a/src/landfill_camera_sim/scripts/fusion_web_streamer.py b/src/landfill_camera_sim/scripts/fusion_web_streamer.py
-index 02e2f24..17fd33e 100755
+index c640250..fefc7ea 100755
 --- a/src/landfill_camera_sim/scripts/fusion_web_streamer.py
 +++ b/src/landfill_camera_sim/scripts/fusion_web_streamer.py
 @@ -29,6 +29,7 @@ which is the actual requirement for a standalone field deployment.
@@ -22,7 +22,7 @@ index 02e2f24..17fd33e 100755
  import os
  import socketserver
  import struct
-@@ -43,6 +44,13 @@ from rclpy.qos import qos_profile_sensor_data
+@@ -44,6 +45,13 @@ from rclpy.qos import qos_profile_sensor_data
  from sensor_msgs.msg import PointCloud2
  from sensor_msgs_py import point_cloud2 as pc2
  
@@ -36,7 +36,7 @@ index 02e2f24..17fd33e 100755
  
  PAGE_HTML = """<!doctype html>
  <html>
-@@ -414,6 +422,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
+@@ -448,6 +456,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
      # FusionWebStreamer.__init__ -- see this module's docstring for why
      # these are served locally instead of from a CDN.
      static_assets: dict = None
@@ -45,16 +45,16 @@ index 02e2f24..17fd33e 100755
      # HTTP/1.1 with keep-alive: a real, measured cost on a Raspberry Pi 5
      # running off a USB-C power bank. A browser actively viewing this page
      # polls every 250ms (merged) or 60ms (live) -- with the old HTTP/1.0
-@@ -488,6 +498,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
-         # buys (see _encode_cloud). Content-Encoding: gzip means the
-         # browser decompresses transparently inside fetch(); no client-
-         # side change needed to receive the benefit.
+@@ -526,6 +536,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
+             stream_state.refresh()
+         except Exception:
+             pass  # serve the previous payload rather than fail the request
 +        if self.diagnostics is not None:
 +            self.diagnostics.note_web_request()
          body, seq = stream_state.get_buffer_and_seq()
          etag = f'"{seq}"'
          if self.headers.get('If-None-Match') == etag:
-@@ -516,6 +528,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
+@@ -554,6 +566,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
              self._serve_cloud(self.shared_state.merged)
          elif self.path == '/live.bin':
              self._serve_cloud(self.shared_state.live)
@@ -69,7 +69,7 @@ index 02e2f24..17fd33e 100755
          elif self.static_assets and self.path in self.static_assets:
              body, content_type = self.static_assets[self.path]
              self._serve_bytes(body, content_type)
-@@ -665,6 +685,8 @@ class FusionWebStreamer(Node):
+@@ -707,6 +727,8 @@ class FusionWebStreamer(Node):
          # the NAT'd hotspot, in case that ever needs re-verifying in the
          # field.
          self.declare_parameter('http_keepalive', True)
@@ -78,7 +78,7 @@ index 02e2f24..17fd33e 100755
  
          merged_topic = str(self.get_parameter('input_topic').value) or str(self.get_parameter('merged_topic').value)
          live_topic = str(self.get_parameter('live_topic').value)
-@@ -674,6 +696,10 @@ class FusionWebStreamer(Node):
+@@ -716,6 +738,10 @@ class FusionWebStreamer(Node):
  
          http_keepalive = bool(self.get_parameter('http_keepalive').value)
  
@@ -88,8 +88,8 @@ index 02e2f24..17fd33e 100755
 +
          self._rng = np.random.default_rng(0)
          self._state = _SharedState()
-         static_assets = _load_static_assets()
-@@ -682,6 +708,7 @@ class FusionWebStreamer(Node):
+         _rng_merged, _rng_live = np.random.default_rng(0), np.random.default_rng(1)
+@@ -727,6 +753,7 @@ class FusionWebStreamer(Node):
              {
                  'shared_state': self._state,
                  'static_assets': static_assets,
@@ -97,7 +97,7 @@ index 02e2f24..17fd33e 100755
                  'protocol_version': 'HTTP/1.1' if http_keepalive else 'HTTP/1.0',
              },
          )
-@@ -699,6 +726,9 @@ class FusionWebStreamer(Node):
+@@ -744,6 +771,9 @@ class FusionWebStreamer(Node):
              PointCloud2, live_topic, self._on_live, qos_profile_sensor_data
          )
  
@@ -109,10 +109,10 @@ index 02e2f24..17fd33e 100755
              % (merged_topic, self._max_points_merged, live_topic, self._max_points_live,
 diff --git a/src/landfill_camera_sim/scripts/sensor_diagnostics.py b/src/landfill_camera_sim/scripts/sensor_diagnostics.py
 new file mode 100644
-index 0000000..3bb12ff
+index 0000000..ca8f41c
 --- /dev/null
 +++ b/src/landfill_camera_sim/scripts/sensor_diagnostics.py
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,312 @@
 +"""Sensor-PC health reporter: answers GET /diagnostics for the base station.
 +
 +DROP-IN for PitFusion3D's `landfill_camera_sim/scripts/` (next to
@@ -374,29 +374,38 @@ index 0000000..3bb12ff
 +        }
 +        for section, is_sensor in (("sensors", True), ("pipelines", False)):
 +            for name, (topic, node_name, target, _t) in self._specs[section].items():
-+                snap = self._trackers[topic].snapshot()
-+                pubs = 0
-+                if self._node is not None:
-+                    try:
-+                        pubs = self._node.count_publishers(topic)
-+                    except Exception:
-+                        pass
-+                alive = (node_name in names) if self._node is not None else None
-+                state, message = classify(pubs, alive, snap, is_sensor=is_sensor)
-+                entry = {
-+                    "state": state,
-+                    "connected": state not in ("disconnected", "not_running"),
-+                    "fps": round(snap["fps"], 2),
-+                    "target_fps": target,
-+                    "last_frame_age_s": None if snap["age"] is None else round(snap["age"], 2),
-+                    "frames": snap["frames"],
-+                    "mb_per_s": round(snap["mb_per_s"], 2),
-+                    "topic": topic,
-+                    "node": node_name,
-+                    "message": message,
-+                }
-+                out[section][name] = entry
++                try:
++                    out[section][name] = self._entry(topic, node_name, target, names, is_sensor)
++                except Exception as exc:
++                    # One misbehaving entry must not turn the whole report into a 500.
++                    out[section][name] = {"state": "unknown", "connected": False,
++                                          "message": f"diagnostic error: {exc!r}"[:120]}
++        return self._with_web_stream(out)
 +
++    def _entry(self, topic, node_name, target, names, is_sensor) -> dict:
++        snap = self._trackers[topic].snapshot()
++        pubs = 0
++        if self._node is not None:
++            try:
++                pubs = self._node.count_publishers(topic)
++            except Exception:
++                pass
++        alive = (node_name in names) if self._node is not None else None
++        state, message = classify(pubs, alive, snap, is_sensor=is_sensor)
++        return {
++            "state": state,
++            "connected": state not in ("disconnected", "not_running"),
++            "fps": round(snap["fps"], 2),
++            "target_fps": target,
++            "last_frame_age_s": None if snap["age"] is None else round(snap["age"], 2),
++            "frames": snap["frames"],
++            "mb_per_s": round(snap["mb_per_s"], 2),
++            "topic": topic,
++            "node": node_name,
++            "message": message,
++        }
++
++    def _with_web_stream(self, out: dict) -> dict:
 +        web = self._web.snapshot()
 +        out["pipelines"]["web_stream"] = {
 +            "state": "running",
@@ -464,10 +473,10 @@ index 0000000..b2697b2
 +echo "Logs: journalctl --user -u pitfusion3d-control.service -f"
 diff --git a/src/pitfusion3d_bringup/scripts/pitfusion_control.py b/src/pitfusion3d_bringup/scripts/pitfusion_control.py
 new file mode 100755
-index 0000000..9451199
+index 0000000..3ad2aea
 --- /dev/null
 +++ b/src/pitfusion3d_bringup/scripts/pitfusion_control.py
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,216 @@
 +#!/usr/bin/env python3
 +"""Always-on power/control daemon for the PitFusion3D sensor PC.
 +
@@ -581,9 +590,27 @@ index 0000000..9451199
 +    t.start()
 +
 +
-+def make_handler(token_loader, runner=run, schedule=None):
++SHUTDOWN_CHECK_TTL = 60.0
++
++
++def make_handler(token_loader, runner=run, schedule=None, clock=time.monotonic):
++    # `sudo -n -l` is a process spawn. The base station polls /status every
++    # second or two, so asking on every poll burned CPU (and battery) on the Pi
++    # for an answer that almost never changes. Ask at most once a minute.
++    shutdown_cache = {"value": False, "at": None}
++
++    def cached_can_shutdown() -> bool:
++        now = clock()
++        if shutdown_cache["at"] is None or now - shutdown_cache["at"] >= SHUTDOWN_CHECK_TTL:
++            shutdown_cache["value"] = can_shutdown(runner)
++            shutdown_cache["at"] = now
++        return shutdown_cache["value"]
++
 +    class Handler(BaseHTTPRequestHandler):
 +        protocol_version = "HTTP/1.1"
++        # Drop a keep-alive connection that goes quiet instead of holding its
++        # thread forever (a laptop that slept, a dropped WiFi client).
++        timeout = 15
 +
 +        def log_message(self, fmt, *args):
 +            pass
@@ -603,7 +630,7 @@ index 0000000..9451199
 +            st = pipeline_status(runner)
 +            st.update({"hostname": socket.gethostname(),
 +                       "control": "enabled" if token_loader() else "disabled",
-+                       "can_shutdown": can_shutdown(runner)})
++                       "can_shutdown": cached_can_shutdown()})
 +            self._json(200, st)
 +
 +        def do_POST(self):

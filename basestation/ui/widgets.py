@@ -543,7 +543,8 @@ class PowerButton(QPushButton):
 
     _ICON_ROLE = {"on": "success", "off": "text_muted", "starting": "warning",
                   "stopping": "warning", "failed": "danger",
-                  "offline": "text_faint", "no_daemon": "text_faint"}
+                  "offline": "text_faint", "no_daemon": "text_faint",
+                  "unknown": "text_faint"}
 
     def __init__(self):
         super().__init__()

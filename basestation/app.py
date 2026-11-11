@@ -14,9 +14,12 @@ import ctypes
 import ctypes.wintypes
 import faulthandler
 import json
+import math
 import os
 import sys
+import threading
 import time
+import traceback
 from datetime import datetime
 
 import matplotlib
@@ -33,7 +36,7 @@ from pyvistaqt import QtInteractor
 from vtkmodules.vtkRenderingCore import vtkPointPicker
 
 from basestation import paths
-from basestation.core import control
+from basestation.core import control, export, netutil
 from basestation.ui import icons
 from basestation.core import processing
 from basestation.ui import theme
@@ -137,6 +140,8 @@ class BaseStation(QMainWindow):
         self._settings = QSettings("SurveyRig", "BaseStation")
         self._control = None
         self._action_worker = None
+        self._retired: list = []        # workers still blocked in a network call; see _retire()
+        self._rec_fail_streak = 0
         self._control_status = None
         self._pending = None            # (action, deadline) while a command is in flight
         self._poweroff_notice = False   # we shut the Pi down; it needs a power-cycle
@@ -556,8 +561,8 @@ class BaseStation(QMainWindow):
 
         self._crop_spins = []
         for axis, lo_name in (("X", 0), ("Y", 2), ("Z", 4)):
-            lo = _spin(-1000, 1000, -1.0, 0.1, 2, " m", 116)
-            hi = _spin(-1000, 1000, 1.0, 0.1, 2, " m", 116)
+            lo = _spin(-100000, 100000, -1.0, 0.1, 2, " m", 116)
+            hi = _spin(-100000, 100000, 1.0, 0.1, 2, " m", 116)
             lo.valueChanged.connect(self._on_crop_spin)
             hi.valueChanged.connect(self._on_crop_spin)
             self._crop_spins += [lo, hi]
@@ -824,9 +829,8 @@ class BaseStation(QMainWindow):
         self._finish_scan()
 
     def _finish_scan(self) -> None:
-        if self._scanner is not None:
-            self._scanner.wait(2000)
-            self._scanner = None
+        scanner, self._scanner = self._scanner, None
+        self._retire(scanner, 2000)
         self.scan_button.setText("  Scan for senders")
         theme.bind_icon(self.scan_button, "search", "text", 15)
 
@@ -836,9 +840,11 @@ class BaseStation(QMainWindow):
                 hosts = json.load(handle)
         except (OSError, ValueError):
             return
-        for host in hosts:
-            if isinstance(host, str) and host:
-                self.host_combo.addItem(host, host)
+        if not isinstance(hosts, list):           # e.g. a hand-edited or damaged file
+            return
+        for host in hosts[:MAX_RECENT_HOSTS]:
+            if isinstance(host, str) and host.strip():
+                self.host_combo.addItem(host.strip(), host.strip())
 
     def _remember_host(self, host: str) -> None:
         hosts = [host]
@@ -853,6 +859,16 @@ class BaseStation(QMainWindow):
         except OSError:
             pass  # a non-writable folder shouldn't break connecting
 
+    def _retire(self, worker, wait_ms: int = 1500) -> None:
+        """Let a worker thread finish. If it is stuck inside a network call, keep
+        a reference until it does: letting Python destroy a running QThread is a
+        hard crash ("QThread: Destroyed while thread is still running")."""
+        if worker is None or worker.wait(wait_ms):
+            return
+        self._retired.append(worker)
+        worker.finished.connect(
+            lambda w=worker: self._retired.remove(w) if w in self._retired else None)
+
     def _toggle_connection(self) -> None:
         if self._worker is not None:
             self._disconnect()
@@ -860,19 +876,26 @@ class BaseStation(QMainWindow):
             self._connect()
 
     def _connect(self) -> None:
-        host = self.host_combo.currentText().strip()
+        try:
+            host, typed_port = netutil.parse_host_input(self._host_text())
+        except ValueError as exc:
+            self.status_pill.set_state("error", str(exc))
+            return
         if not host:
             self.status_pill.set_state(
                 "error", "Enter the rover's IP, or press Scan to find one.")
             return
+        if typed_port:                                  # "192.168.1.5:8080" typed in the host box
+            self.port_spin.setValue(typed_port)
+        self.host_combo.setCurrentText(host)            # show what will actually be used
 
-        url = f"http://{host}:{self.port_spin.value()}/latest.bin"
+        url = netutil.http_url(host, self.port_spin.value(), "/latest.bin")
         self._stats.reset()
         self._remember_host(host)
 
         self._worker = PollWorker(url, self.interval_spin.value(), self._stats,
                                    timeout=self._timeout)
-        self._worker.frame_ready.connect(self._on_frame)
+        self._worker.frame_ready.connect(self._on_frame_ready)
         self._worker.state_changed.connect(self._on_state_changed)
         self._worker.start()
 
@@ -885,10 +908,10 @@ class BaseStation(QMainWindow):
         self._restyle(self.connect_button)
 
     def _disconnect(self) -> None:
-        if self._worker is not None:
-            self._worker.stop()
-            self._worker.wait(3000)
-            self._worker = None
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.stop()
+            self._retire(worker)
         if self._recorder.active:
             self._stop_recording("Recording stopped - disconnected.")
         self.connect_button.setText("Connect")
@@ -916,11 +939,20 @@ class BaseStation(QMainWindow):
         control.ON: "Running", control.OFF: "Stopped", control.STARTING: "Starting...",
         control.STOPPING: "Stopping...", control.FAILED: "Failed - check the Pi's logs",
         control.OFFLINE: "Unreachable", control.NO_DAEMON: "No control service",
+        control.UNKNOWN: "Unknown",
     }
 
+    def _host_text(self) -> str:
+        """The host box text, minus a scan label like "10.0.0.5  -  20,000 pts"."""
+        text = self.host_combo.currentText().strip()
+        return text.split()[0] if " - " in text else text
+
     def _current_host(self) -> str:
-        host = self.host_combo.currentText().strip()
-        return host.split()[0] if " - " in host else host
+        """The cleaned host, or "" if the box is empty or not a valid address."""
+        try:
+            return netutil.parse_host_input(self._host_text())[0]
+        except ValueError:
+            return ""
 
     def _power_section(self) -> QWidget:
         sec = widgets.Section(
@@ -933,8 +965,11 @@ class BaseStation(QMainWindow):
 
         self.control_port_spin = QSpinBox()
         self.control_port_spin.setRange(1, 65535)
-        self.control_port_spin.setValue(
-            int(self._settings.value("control_port", control.DEFAULT_CONTROL_PORT)))
+        try:
+            saved_port = int(self._settings.value("control_port", control.DEFAULT_CONTROL_PORT))
+        except (TypeError, ValueError):
+            saved_port = control.DEFAULT_CONTROL_PORT
+        self.control_port_spin.setValue(saved_port)
         self.control_port_spin.setFixedWidth(104)
         self.control_port_spin.valueChanged.connect(self._on_control_port_changed)
         sec.add(widgets.row("Control port", self.control_port_spin)[0])
@@ -950,7 +985,13 @@ class BaseStation(QMainWindow):
         self.power_hint = widgets.hint("")
         self.power_hint.setVisible(False)
         sec.add(self.power_hint)
-        self.host_combo.editTextChanged.connect(lambda _t: self._retarget_control())
+        # Retarget only once typing pauses: every keystroke used to restart polling
+        # (and trigger a DNS lookup) for hosts like "1", "19", "192"...
+        self._retarget_timer = QTimer(self)
+        self._retarget_timer.setSingleShot(True)
+        self._retarget_timer.setInterval(600)
+        self._retarget_timer.timeout.connect(self._retarget_control)
+        self.host_combo.editTextChanged.connect(lambda _t: self._retarget_timer.start())
         return sec
 
     def _set_power_hint(self, text: str) -> None:
@@ -969,6 +1010,7 @@ class BaseStation(QMainWindow):
             return
         self._control_status = None
         self._poweroff_notice = False
+        self._pending = None
         host = self._current_host()
         self._control.set_target(host, self.control_port_spin.value())
         if not host:
@@ -979,6 +1021,10 @@ class BaseStation(QMainWindow):
         self._retarget_control()
 
     def _on_control_status(self, st) -> None:
+        # A reply for a host/port the user has since changed must not overwrite
+        # the state shown for the new one.
+        if st.target and st.target != (self._current_host(), self.control_port_spin.value()):
+            return
         self._control_status = st
         state = st.state
         now = time.time()
@@ -995,13 +1041,22 @@ class BaseStation(QMainWindow):
                     state = control.STOPPING
             else:
                 target = control.OFF if action == "stop" else control.ON
-                if st.kind == "ok" and state == target or now > deadline:
+                if st.kind == "ok" and state == target:
+                    self._pending = None              # did what was asked
+                    self._set_power_hint("")
+                elif st.kind == "ok" and state == control.FAILED:
+                    self._pending = None              # don't spin "starting" for 45 s
+                    self._set_power_hint("The pipeline failed - check the Pi's logs "
+                                         "(journalctl --user -u pitfusion3d.service).")
+                elif now > deadline:
                     self._pending = None
                 else:
                     state = control.STOPPING if action == "stop" else control.STARTING
 
         if st.kind == "ok":
-            self._poweroff_notice = False             # it is back (power-cycled)
+            if self._poweroff_notice:                 # it is back (power-cycled)
+                self._poweroff_notice = False
+                self._set_power_hint("")
         elif self._poweroff_notice:
             state = control.OFFLINE
         self._show_power_state(state)
@@ -1018,6 +1073,7 @@ class BaseStation(QMainWindow):
             control.STOPPING: "Stopping...",
             control.FAILED: "Sensor pipeline failed - click to try starting it again",
             control.OFFLINE: "Sensor PC unreachable",
+            control.UNKNOWN: "The sensor PC reports a state this app doesn't recognise",
             control.NO_DAEMON: "Control service not installed on the sensor PC "
                                "(see sensor_side/README.md)",
         }
@@ -1149,7 +1205,11 @@ class BaseStation(QMainWindow):
             self.status_pill.set_state(
                 "error", "Enter the rover's address first, then open Diagnostics.")
             return
-        port = self.port_spin.value()
+        try:
+            typed_port = netutil.parse_host_input(self._host_text())[1]
+        except ValueError:
+            typed_port = None
+        port = typed_port or self.port_spin.value()
         if self._diag is not None:
             self._diag.set_target(host, port)
             self._diag.raise_()
@@ -1233,6 +1293,13 @@ class BaseStation(QMainWindow):
                 self._latest_frame = self._stream_frame
                 self._refresh_view()
 
+    def _on_frame_ready(self) -> None:
+        """The worker has a new frame in its mailbox; fetch the newest one."""
+        worker = self._worker
+        frame = worker.take_frame() if worker is not None else None
+        if frame is not None:
+            self._on_frame(frame)
+
     def _on_frame(self, frame: Frame) -> None:
         self._stream_frame = frame
         if self._view_paused:
@@ -1247,6 +1314,10 @@ class BaseStation(QMainWindow):
         """Run the processing pipeline on the current frame and draw it."""
         frame = self._latest_frame
         if frame is None:
+            return
+        if self._tool == "crop" and not self._crop_seeded and frame.num_points:
+            self._fit_crop_to_cloud()                 # first data after entering Crop
+            self.crop_switch.setChecked(True)         # both re-enter _refresh_view
             return
         idx = self._pipeline.apply(frame.xyz, frame.temp_c)
         if idx is None:
@@ -1287,6 +1358,10 @@ class BaseStation(QMainWindow):
         rebuild = self._cloud is None or self._xyz_buffer is None \
             or len(self._xyz_buffer) != n
 
+        # The previous cloud's VTK objects still point into the OLD buffers until
+        # the actor is replaced and the scene redrawn; holding them in `old` until
+        # this method returns keeps that memory valid for exactly that long.
+        old = (self._xyz_buffer, self._color_buffer, self._cloud)
         if rebuild:
             self._xyz_buffer = np.empty((n, 3), dtype=np.float32)
             self._color_buffer = np.empty((n, 3), dtype=np.uint8)
@@ -1324,23 +1399,26 @@ class BaseStation(QMainWindow):
                 scalars.Modified()
             self._cloud.Modified()
 
-        if not self._camera_fitted:
+        # Wait for a cloud worth framing: fitting the camera to the first 1-2
+        # stray points would leave it zoomed on nothing once real data arrives.
+        if not self._camera_fitted and n >= 20:
             self._camera_fitted = True
             self.plotter.reset_camera()
             if self.grid_switch.isChecked():
                 self._show_scale_grid(True)
 
         self.plotter.render()
+        del old
 
     def _compute_colors(self, frame: Frame) -> np.ndarray:
         if self.color_seg.index() == 0:
             self._temp_range = None
             self.temp_label.setText("n/a")
-            rgb = np.clip(frame.rgb, 0.0, 1.0)
+            rgb = np.clip(np.nan_to_num(frame.rgb, nan=0.5), 0.0, 1.0)
             return (rgb * 255).astype(np.uint8)
 
         temp = frame.temp_c
-        valid = ~np.isnan(temp)
+        valid = np.isfinite(temp)          # inf would make the colour span infinite -> NaN colours
         colors = np.tile(np.array(INVALID_THERMAL_COLOR, dtype=np.uint8), (len(temp), 1))
 
         if not np.any(valid):
@@ -1472,10 +1550,14 @@ class BaseStation(QMainWindow):
     # -- crop ------------------------------------------------------------
 
     def _enter_crop(self) -> None:
-        if not self._crop_seeded:
-            self._fit_crop_to_cloud(enable=False)
-        if not self.crop_switch.isChecked():
-            self.crop_switch.setChecked(True)     # applies immediately via toggle handler
+        # With no data yet there is nothing to frame the box around. Applying the
+        # placeholder +-1 m box would crop every incoming frame to a 2 m cube, so
+        # wait: _refresh_view finishes the set-up when the first frame arrives.
+        if self._latest_frame is not None and self._latest_frame.num_points:
+            if not self._crop_seeded:
+                self._fit_crop_to_cloud(enable=False)
+            if not self.crop_switch.isChecked():
+                self.crop_switch.setChecked(True)     # applies immediately via toggle handler
         self._set_crop_widget_visible(True)
 
     def _set_crop_widget_visible(self, visible: bool) -> None:
@@ -1522,7 +1604,10 @@ class BaseStation(QMainWindow):
         if bounds is None:
             bounds = (-1.0, 1.0, -1.0, 1.0, -1.0, 1.0)
         else:
-            bounds = tuple(round(v, 2) for v in bounds)
+            # Round OUTWARD (mins down, maxes up). Plain rounding can put an
+            # extreme point just outside the box and silently cut it.
+            bounds = tuple(math.floor(v * 100) / 100 if i % 2 == 0 else math.ceil(v * 100) / 100
+                           for i, v in enumerate(bounds))
         self._crop_seeded = True
         self._set_crop_bounds(bounds)
 
@@ -1585,7 +1670,7 @@ class BaseStation(QMainWindow):
         self._update_measure()
 
     def _undo_measure_point(self) -> None:
-        if self._measure_pts:
+        if self._tool == "measure" and self._measure_pts:
             self._measure_pts.pop()
             self._update_measure()
 
@@ -1711,11 +1796,12 @@ class BaseStation(QMainWindow):
 
         suggested = os.path.join(
             self._default_capture_dir(), f"frame_{datetime.now():%Y%m%d_%H%M%S}.pcd")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save point cloud", suggested,
-            "Point cloud (*.pcd);;PLY (*.ply);;All files (*)")
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "Save point cloud", suggested, "Point cloud (*.pcd);;PLY (*.ply)")
         if not path:
             return
+        if os.path.splitext(path)[1].lower() not in (".pcd", ".ply"):
+            path += ".ply" if "ply" in chosen.lower() else ".pcd"      # no extension typed
 
         if self._write_cloud(path, self._view, self._color_buffer):
             self._set_capture_status(
@@ -1725,16 +1811,10 @@ class BaseStation(QMainWindow):
 
     @staticmethod
     def _write_cloud(path: str, frame: Frame, colors: np.ndarray) -> bool:
-        import open3d as o3d
-
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(frame.xyz.astype(np.float64))
-        if colors is not None and len(colors) == frame.num_points:
-            pcd.colors = o3d.utility.Vector3dVector(
-                np.asarray(colors, dtype=np.float64) / 255.0)
         try:
-            return bool(o3d.io.write_point_cloud(path, pcd))
-        except (OSError, RuntimeError):
+            export.write_cloud(path, frame.xyz, colors)
+            return True
+        except (OSError, ValueError):       # unwritable folder, disk full, bad extension
             return False
 
     def _save_screenshot(self) -> None:
@@ -1742,12 +1822,14 @@ class BaseStation(QMainWindow):
             self._default_capture_dir(), f"view_{datetime.now():%Y%m%d_%H%M%S}.png")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save screenshot", suggested,
-            "PNG image (*.png);;JPEG image (*.jpg);;All files (*)")
+            "PNG image (*.png);;JPEG image (*.jpg)")
         if not path:
             return
+        if os.path.splitext(path)[1].lower() not in (".png", ".jpg", ".jpeg"):
+            path += ".png"                                              # no extension typed
         try:
             self.plotter.screenshot(path)
-        except (OSError, RuntimeError):
+        except Exception:                   # VTK/IO errors come in many types
             self._set_capture_status(f"Could not write {os.path.basename(path)}")
             return
         self._set_capture_status(f"Saved {os.path.basename(path)}")
@@ -1819,6 +1901,10 @@ class BaseStation(QMainWindow):
         path = os.path.join(self._recorder.folder, name)
         ok = self._write_cloud(path, view, self._color_buffer)
         self._recorder.note_saved(ok)
+        self._rec_fail_streak = 0 if ok else self._rec_fail_streak + 1
+        if self._rec_fail_streak >= 3:
+            self._stop_recording("Recording stopped - cannot write to the folder.")
+            return
 
         remaining = max(0.0, self._recorder.duration - self._recorder.elapsed())
         self.record_pill.set_state(
@@ -1846,17 +1932,15 @@ class BaseStation(QMainWindow):
     def closeEvent(self, event):
         if self._diag is not None:
             self._diag.close()
-        if self._control is not None:
-            self._control.stop()
-            self._control.wait(3000)
-        if self._action_worker is not None:
-            self._action_worker.wait(3000)
-        if self._worker is not None:
-            self._worker.stop()
-            self._worker.wait(3000)
-        if self._scanner is not None:
-            self._scanner.stop()
-            self._scanner.wait(3000)
+        workers = [w for w in (self._worker, self._scanner, self._control,
+                               self._action_worker, *self._retired) if w is not None]
+        for w in workers:
+            if hasattr(w, "stop"):
+                w.stop()
+        for w in workers:
+            if not w.wait(2000) and w.isRunning():
+                w.terminate()              # last resort, at exit only
+                w.wait(500)
         for tag in self._observer_tags:
             self._vtk_iren.RemoveObserver(tag)
         self.plotter.close()
@@ -1864,6 +1948,23 @@ class BaseStation(QMainWindow):
 
 
 _fault_log = None
+
+
+def _install_exception_logging() -> None:
+    """Under pythonw.exe there is no stderr, so an uncaught Python exception
+    (in a Qt slot, or a worker thread) just vanished. Write it to data/crash.log."""
+    def log(kind, value, tb):
+        try:
+            with open(paths.data_path("crash.log"), "a", encoding="utf-8") as fh:
+                fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+                traceback.print_exception(kind, value, tb, file=fh)
+        except Exception:
+            pass
+        if sys.stderr is not None:
+            sys.__excepthook__(kind, value, tb)
+
+    sys.excepthook = log
+    threading.excepthook = lambda a: log(a.exc_type, a.exc_value, a.exc_traceback)
 
 
 def _enable_fault_log() -> None:
@@ -1884,6 +1985,7 @@ def main():
     # launcher) sys.stderr is None, and faulthandler.enable() would itself
     # raise and kill the app before the window ever appears.
     _enable_fault_log()
+    _install_exception_logging()
 
     parser = argparse.ArgumentParser(description="Survey rig base station")
     parser.add_argument("--rover-host", default="",

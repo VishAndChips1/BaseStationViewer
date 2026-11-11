@@ -259,29 +259,38 @@ class DiagnosticsCollector:
         }
         for section, is_sensor in (("sensors", True), ("pipelines", False)):
             for name, (topic, node_name, target, _t) in self._specs[section].items():
-                snap = self._trackers[topic].snapshot()
-                pubs = 0
-                if self._node is not None:
-                    try:
-                        pubs = self._node.count_publishers(topic)
-                    except Exception:
-                        pass
-                alive = (node_name in names) if self._node is not None else None
-                state, message = classify(pubs, alive, snap, is_sensor=is_sensor)
-                entry = {
-                    "state": state,
-                    "connected": state not in ("disconnected", "not_running"),
-                    "fps": round(snap["fps"], 2),
-                    "target_fps": target,
-                    "last_frame_age_s": None if snap["age"] is None else round(snap["age"], 2),
-                    "frames": snap["frames"],
-                    "mb_per_s": round(snap["mb_per_s"], 2),
-                    "topic": topic,
-                    "node": node_name,
-                    "message": message,
-                }
-                out[section][name] = entry
+                try:
+                    out[section][name] = self._entry(topic, node_name, target, names, is_sensor)
+                except Exception as exc:
+                    # One misbehaving entry must not turn the whole report into a 500.
+                    out[section][name] = {"state": "unknown", "connected": False,
+                                          "message": f"diagnostic error: {exc!r}"[:120]}
+        return self._with_web_stream(out)
 
+    def _entry(self, topic, node_name, target, names, is_sensor) -> dict:
+        snap = self._trackers[topic].snapshot()
+        pubs = 0
+        if self._node is not None:
+            try:
+                pubs = self._node.count_publishers(topic)
+            except Exception:
+                pass
+        alive = (node_name in names) if self._node is not None else None
+        state, message = classify(pubs, alive, snap, is_sensor=is_sensor)
+        return {
+            "state": state,
+            "connected": state not in ("disconnected", "not_running"),
+            "fps": round(snap["fps"], 2),
+            "target_fps": target,
+            "last_frame_age_s": None if snap["age"] is None else round(snap["age"], 2),
+            "frames": snap["frames"],
+            "mb_per_s": round(snap["mb_per_s"], 2),
+            "topic": topic,
+            "node": node_name,
+            "message": message,
+        }
+
+    def _with_web_stream(self, out: dict) -> dict:
         web = self._web.snapshot()
         out["pipelines"]["web_stream"] = {
             "state": "running",

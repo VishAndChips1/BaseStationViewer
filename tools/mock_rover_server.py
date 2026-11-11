@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sensor_side"))
 import threading
 
 import pitfusion_control as pc
-from basestation.core.protocol import COUNT_STRUCT, POINT_DTYPE
+from basestation.core.protocol import COUNT_STRUCT, POINT_DTYPE, encode_rig_frame
 
 
 def make_frame_points(n: int, t: float) -> np.ndarray:
@@ -181,10 +181,34 @@ def make_diagnostics() -> dict:
 class Handler(BaseHTTPRequestHandler):
     points_per_frame = 20000
     scene = "sphere"
+    wire = "float32"            # or "rig": gzip + int16-quantized + ETag, like PitFusion3D
+    _rig_cache = (None, b"")    # (seq, body): one stable frame per second, like the 1 Hz merged cloud
     diagnostics_enabled = True
 
     def log_message(self, fmt, *args):
         pass  # keep the console quiet
+
+    def _serve_rig(self):
+        seq = int(time.time())                       # a new frame once a second
+        etag = f'"{seq}"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.end_headers()
+            return
+        cached_seq, body = Handler._rig_cache
+        if cached_seq != seq:
+            pts = (make_terrain_points if self.scene == "terrain" else make_frame_points)(
+                self.points_per_frame, time.time())
+            body = encode_rig_frame(pts["xyz"], pts["rgb"], pts["thermal_k"], seq, gzip_it=True)
+            Handler._rig_cache = (seq, body)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         if SYSTEMD.state != "active":      # pipeline stopped: nothing is served
@@ -205,6 +229,9 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if self.wire == "rig":
+            return self._serve_rig()
+
         points = (make_terrain_points if self.scene == "terrain" else make_frame_points)(
             self.points_per_frame, time.time())
         body = COUNT_STRUCT.pack(len(points)) + points.tobytes()
@@ -223,6 +250,8 @@ def main():
     parser.add_argument("--points", type=int, default=20000)
     parser.add_argument("--scene", choices=("sphere", "terrain"), default="sphere",
                         help="synthetic scene to serve (terrain is handy for screenshots)")
+    parser.add_argument("--wire", choices=("float32", "rig"), default="float32",
+                        help="body layout: plain float32, or the rig's gzip+quantized+ETag format")
     parser.add_argument("--no-diagnostics", action="store_true",
                         help="answer /diagnostics with 404, like an un-upgraded sensor PC")
     parser.add_argument("--control-port", type=int, default=8081,
@@ -232,6 +261,7 @@ def main():
 
     Handler.points_per_frame = args.points
     Handler.scene = args.scene
+    Handler.wire = args.wire
     Handler.diagnostics_enabled = not args.no_diagnostics
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     SERVERS.append(server)

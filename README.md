@@ -37,10 +37,10 @@ Press **Scan for senders**, pick the rover, then **Connect**. Python 3.10+.
 No rig? Run a stand-in and connect to `127.0.0.1`:
 
 ```bash
-python tools/mock_rover_server.py --scene terrain --token demo
+python tools/mock_rover_server.py --scene terrain --wire rig --token demo
 ```
 
-It serves a cloud, simulated diagnostics, and the real control daemon over a fake systemd.
+It serves a cloud (`--wire rig` uses the rig's real gzip format), simulated diagnostics, and the real control daemon over a fake systemd.
 
 ## Sensor PC
 
@@ -63,6 +63,13 @@ data/           created at run time: recent hosts, crash log, captures (git-igno
 
 ## Protocol
 
-`GET http://<rover>:<port>/latest.bin` returns one frame, little-endian: `uint32 N`, then `N x 7 float32` (`x y z r g b thermal`; metres, RGB already 0-1, thermal in Kelvin or NaN). Only `basestation/core/protocol.py` parses it, so a format change touches one file.
+`GET http://<rover>:<port>/latest.bin` returns one frame. Two layouts are understood and told apart by length alone; a gzip wrapper is detected and removed first:
+
+- **float32**: `uint32 N`, then `N x 7 float32` (`x y z r g b thermal`; metres, RGB 0-1, thermal in Kelvin or NaN)
+- **rig** (what [PitFusion3D](https://github.com/VishAndChips1/PitFusion3D) sends, normally gzipped): `uint32 N, uint32 seq, float32 ox oy oz scale`, then `N x { int16 xyz, uint8 rgb, int16 thermal }` (xyz = q * scale + offset; thermal = Kelvin x 100, `-32768` = none)
+
+Points with NaN/infinite coordinates are dropped on parse. The rig answers `304` for an unchanged frame, which the app honours (an `ETag` is sent back), so a 5 Hz poll of a 1 Hz cloud costs one download per second. Only `basestation/core/protocol.py` parses frames, so a format change touches one file.
+
+Known rig-side limit: thermal is stored as Kelvin x 100 in an `int16`, which tops out at 327.67 K (54.5 C); anything hotter reads as 54.5 C.
 
 Trusted LAN only: no authentication or encryption on the point-cloud feed.
