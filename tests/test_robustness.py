@@ -309,6 +309,15 @@ class ClientRobustnessTests(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_a_closed_control_port_is_reported_as_a_missing_service_not_a_bad_address(self):
+        """Streaming worked but the control service wasn't installed; the app blamed the network."""
+        import socket
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        st = control.get_status("127.0.0.1", port, timeout=6)       # Windows takes ~2 s to refuse loopback
+        self.assertEqual((st.kind, st.state), ("no_daemon", control.NO_DAEMON))
+        self.assertIn("nothing is listening", st.detail)
+        self.assertIn(str(port), st.detail)
+
     def test_unknown_pipeline_state_is_not_shown_as_off(self):
         """'off' invites a click on Start for a pipeline nobody actually knows the state of."""
         for raw in ("unknown", "", "maintenance", None):

@@ -60,8 +60,20 @@ def get_status(host: str, port: int, timeout: float = 2.0) -> ControlStatus:
             return ControlStatus("no_daemon", NO_DAEMON,
                                  detail="Nothing answers as a control daemon here")
         return ControlStatus("unreachable", OFFLINE, detail=f"HTTP {exc.code}")
-    except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException):
-        return ControlStatus("unreachable", OFFLINE, detail="Sensor PC not answering")
+    except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, ConnectionRefusedError):
+            # The machine answered and said "nothing here": it is up, but the
+            # control service is not running on that port. Say so, rather than
+            # blaming the address or the network.
+            return ControlStatus(
+                "no_daemon", NO_DAEMON,
+                detail=f"The sensor PC is reachable, but nothing is listening for "
+                       f"control commands on port {port}.")
+        return ControlStatus(
+            "unreachable", OFFLINE,
+            detail=f"No reply from {host} on port {port}: wrong address, the Pi is off, "
+                   f"or a firewall is blocking that port.")
     except (ValueError, RecursionError):
         return ControlStatus("no_daemon", NO_DAEMON, detail="Unreadable reply")
     if not isinstance(data, dict):

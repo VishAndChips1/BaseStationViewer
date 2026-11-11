@@ -1096,20 +1096,22 @@ class BaseStation(QMainWindow):
             self.host_combo.setFocus()
             self._set_power_hint("Enter the rover's address first.")
             return
+        st = self._control_status
         if state == control.OFFLINE:
             self._show_tab(0)
             self._set_power_hint(
                 "The Raspberry Pi is not answering. If it was powered off, it has "
                 "to be power-cycled by hand to turn it back on."
                 if self._poweroff_notice else
-                "The sensor PC is not answering. Check its address and that it is on "
-                "the network.")
+                (st.detail if st is not None and st.detail else
+                 "The sensor PC is not answering the control port."))
             return
         if state == control.NO_DAEMON:
             self._show_tab(0)
             self._set_power_hint(
-                "No control service on the sensor PC. Install it with "
-                "sensor_side/install_control.sh (see sensor_side/README.md).")
+                ((st.detail + " ") if st is not None and st.detail else "")
+                + "Install the control service on the Pi: run install_control.sh "
+                  "(see sensor_side/README.md), then paste the token it prints.")
             return
         if not self.token_edit.text().strip():
             self._show_tab(0)
