@@ -32,6 +32,7 @@ STUBS = {
     "id": '#!/usr/bin/env bash\ncase "$1" in -u) echo "${STUB_UID:-1000}";; -un) echo vish;; *) echo vish;; esac\n',
     "loginctl": '#!/usr/bin/env bash\necho "loginctl $*" >> "$STUB_LOG"\n',
     "systemctl": ('#!/usr/bin/env bash\necho "systemctl $*" >> "$STUB_LOG"\n'
+                  '[ -n "${STUB_HANG:-}" ] && [ "$2" = "daemon-reload" ] && sleep 60\n'
                   'if [ "$1 $2" = "--user cat" ] && [ "${STUB_NO_PIPELINE:-0}" = "1" ]; then exit 1; fi\n'),
     "ufw": '#!/usr/bin/env bash\necho "ufw $*" >> "$STUB_LOG"\n',
     "visudo": '#!/usr/bin/env bash\necho "visudo $*" >> "$STUB_LOG"\nexit "${STUB_VISUDO_RC:-0}"\n',
@@ -129,6 +130,20 @@ class InstallerTests(unittest.TestCase):
         r = self.run_installer(STUB_NO_PIPELINE=1)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("pitfusion3d.service is not installed", r.stdout + r.stderr)
+
+    def test_a_hung_systemd_call_becomes_a_visible_error_not_a_frozen_terminal(self):
+        """The user's terminal sat silent forever; every blocking step now has a time limit."""
+        import time
+        started = time.time()
+        r = self.run_installer(STUB_HANG=1, PITFUSION_STEP_TIMEOUT=2)
+        self.assertLess(time.time() - started, 25)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("failed or timed out", r.stdout + r.stderr)
+        self.assertIn("installer - starting", r.stdout)          # it said something straight away
+
+    def test_prints_immediately_before_doing_any_work(self):
+        r = self.run_installer()
+        self.assertTrue(r.stdout.lstrip().startswith("PitFusion3D control installer - starting"))
 
     def test_refuses_to_run_as_root(self):
         r = self.run_installer(STUB_UID=0)
