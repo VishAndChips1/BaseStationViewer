@@ -76,6 +76,36 @@ few seconds every minute. `--no-diagnostics` serves a 404 instead, to see
 how the app reports a sensor PC that has not been upgraded.
 
 
+## Quick setup of Power control (one command, on the Pi)
+
+Run this **on the Raspberry Pi** as your normal user (not root). It needs only the
+Pi's internet access and `sudo`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VishAndChips1/GroundStation3D/main/sensor_side/pi_setup.sh | bash
+```
+
+It installs the control service (runs at boot, no login needed), opens port 8081 in
+`ufw` if that firewall is active, adds a `sudo` rule that allows **only**
+`systemctl poweroff` without a password, checks that the service answers, and prints
+the **token**. Paste the token into the base station: **Rover tab > Sensor PC power >
+Control token**. Safe to re-run; the token is kept. No internet on the Pi? Copy
+`pi_setup.sh` over by USB and run `bash pi_setup.sh`.
+
+If the base station can see the stream but not the control port, the Pi's firewall is
+usually the reason (the stream's port 8080 may be open while 8081 is not). The app tells
+you which case it is: "nothing is listening on port 8081" means the service is not
+running; "no reply ... firewall" means the port is blocked or the address is wrong.
+
+### Powering **on** is not possible over WiFi
+
+A Raspberry Pi that has shut down has no network at all, and when the Pi *is* the WiFi
+hotspot (`PitFusion3D-AP`) the hotspot disappears with it, so there is nothing for the
+base station to talk to. This is a hardware limit, not something software can change.
+To bring a powered-off Pi back: press the Pi 5's power button, or cut and restore its
+power; or put a smart plug / relay in the power feed. The **power icon's "on"** action
+starts the sensor *pipeline* on a Pi that is up but has its pipeline stopped.
+
 ## Power control
 
 The base station's power icon (title bar) talks to `pitfusion_control.py`, a

@@ -1053,6 +1053,16 @@ class BaseStation(QMainWindow):
                 else:
                     state = control.STOPPING if action == "stop" else control.STARTING
 
+        if st.kind == "ok" and not st.installed and self._pending is None:
+            # The Pi answers, but there is no pitfusion3d.service to start or stop
+            # (the pipeline may be launched by hand). Power off still works, so
+            # keep the menu available instead of pretending the pipeline is "off".
+            state = control.UNKNOWN
+            self._set_power_hint(
+                "The sensor pipeline isn't installed as a service on the Pi "
+                "(pitfusion3d.service), so Start / Stop / Restart can't act on it. "
+                "Power off still works. Install the service with install_autostart.sh.")
+
         if st.kind == "ok":
             if self._poweroff_notice:                 # it is back (power-cycled)
                 self._poweroff_notice = False

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -89,7 +90,9 @@ class PiDaemonTests(unittest.TestCase):
             return 0, ""
 
         clock = {"t": 1000.0}
-        pc.shutil.which = lambda _n: "/usr/bin/systemctl"
+        patcher = mock.patch.object(pc.shutil, "which", lambda _n: "/usr/bin/systemctl")
+        patcher.start()
+        self.addCleanup(patcher.stop)       # shutil is global: never leak the fake into other tests
         from http.server import ThreadingHTTPServer
         import threading, urllib.request
         handler = pc.make_handler(lambda: "tok", runner=runner, clock=lambda: clock["t"])
@@ -107,6 +110,36 @@ class PiDaemonTests(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_status_says_when_the_pipeline_service_does_not_exist(self):
+        """Power off must still make sense on a Pi where the pipeline is launched by hand."""
+        from basestation.core import control
+
+        def status_for(load_state):
+            def runner(cmd, timeout=20):
+                if cmd[:3] == ["systemctl", "--user", "show"]:
+                    lines = ["ActiveState=inactive", "SubState=dead", "ActiveEnterTimestamp=",
+                             f"LoadState={load_state}"]
+                    return 0, "\n".join(lines)
+                return 0, ""
+            from http.server import ThreadingHTTPServer
+            import threading
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), pc.make_handler(lambda: "t", runner=runner))
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                with mock.patch.object(pc.shutil, "which", lambda _n: "/usr/bin/systemctl"):
+                    return control.get_status("127.0.0.1", srv.server_address[1])
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+        self.assertFalse(status_for("not-found").installed)
+        self.assertTrue(status_for("loaded").installed)
+
+    def test_if_systemctl_itself_fails_the_pipeline_is_not_declared_missing(self):
+        st = pc.pipeline_status(lambda cmd, timeout=20: (1, "Failed to connect to bus"))
+        self.assertTrue(st["installed"])
+        self.assertEqual(st["pipeline"], "unknown")
 
     def test_idle_connections_time_out(self):
         self.assertGreater(pc.make_handler(lambda: "t").timeout, 0)

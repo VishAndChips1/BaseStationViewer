@@ -44,7 +44,7 @@ It serves a cloud (`--wire rig` uses the rig's real gzip format), simulated diag
 
 ## Sensor PC
 
-The rig is [PitFusion3D](https://github.com/VishAndChips1/PitFusion3D) (ROS 2 on a Raspberry Pi). Diagnostics and power control need a small addition there; see [`sensor_side/README.md`](sensor_side/README.md) (one `git apply`, one install script). Without it, everything else still works.
+The rig is [PitFusion3D](https://github.com/VishAndChips1/PitFusion3D) (ROS 2 on a Raspberry Pi). Diagnostics and power control need a small addition there; see [`sensor_side/README.md`](sensor_side/README.md): Power control is one `curl` command on the Pi (`sensor_side/pi_setup.sh`). Without it, everything else still works.
 
 ## Layout
 

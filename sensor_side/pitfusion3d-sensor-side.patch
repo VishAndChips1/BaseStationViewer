@@ -473,10 +473,10 @@ index 0000000..b2697b2
 +echo "Logs: journalctl --user -u pitfusion3d-control.service -f"
 diff --git a/src/pitfusion3d_bringup/scripts/pitfusion_control.py b/src/pitfusion3d_bringup/scripts/pitfusion_control.py
 new file mode 100755
-index 0000000..3ad2aea
+index 0000000..13cf427
 --- /dev/null
 +++ b/src/pitfusion3d_bringup/scripts/pitfusion_control.py
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,219 @@
 +#!/usr/bin/env python3
 +"""Always-on power/control daemon for the PitFusion3D sensor PC.
 +
@@ -553,11 +553,14 @@ index 0000000..3ad2aea
 +
 +def pipeline_status(runner=run) -> dict:
 +    code, out = runner(["systemctl", "--user", "show", UNIT,
-+                        "--property=ActiveState,SubState,ActiveEnterTimestamp"], 5)
++                        "--property=ActiveState,SubState,ActiveEnterTimestamp,LoadState"], 5)
 +    props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 +    return {"pipeline": props.get("ActiveState", "unknown"),
 +            "sub": props.get("SubState", ""),
-+            "since": props.get("ActiveEnterTimestamp", "")}
++            "since": props.get("ActiveEnterTimestamp", ""),
++            # False only when systemd positively says the unit does not exist; if
++            # systemctl itself failed we don't know, so don't claim it is missing.
++            "installed": props.get("LoadState", "") != "not-found"}
 +
 +
 +def can_shutdown(runner=run) -> bool:

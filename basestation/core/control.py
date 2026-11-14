@@ -48,6 +48,7 @@ class ControlStatus:
     since: str = ""
     detail: str = ""
     target: tuple = ()       # (host, port) this status answers, set by the poller
+    installed: bool = True   # False: the pipeline's systemd unit does not exist on the Pi
 
 
 def get_status(host: str, port: int, timeout: float = 2.0) -> ControlStatus:
@@ -82,7 +83,8 @@ def get_status(host: str, port: int, timeout: float = 2.0) -> ControlStatus:
         "ok", ui_state(data.get("pipeline", "")),
         control_enabled=data.get("control") == "enabled",
         can_shutdown=bool(data.get("can_shutdown")),
-        hostname=str(data.get("hostname", "")), since=str(data.get("since", "")))
+        hostname=str(data.get("hostname", "")), since=str(data.get("since", "")),
+        installed=bool(data.get("installed", True)))
 
 
 def send_action(host: str, port: int, action: str, token: str,

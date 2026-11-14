@@ -74,11 +74,14 @@ def token_ok(supplied: str, expected: str) -> bool:
 
 def pipeline_status(runner=run) -> dict:
     code, out = runner(["systemctl", "--user", "show", UNIT,
-                        "--property=ActiveState,SubState,ActiveEnterTimestamp"], 5)
+                        "--property=ActiveState,SubState,ActiveEnterTimestamp,LoadState"], 5)
     props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
     return {"pipeline": props.get("ActiveState", "unknown"),
             "sub": props.get("SubState", ""),
-            "since": props.get("ActiveEnterTimestamp", "")}
+            "since": props.get("ActiveEnterTimestamp", ""),
+            # False only when systemd positively says the unit does not exist; if
+            # systemctl itself failed we don't know, so don't claim it is missing.
+            "installed": props.get("LoadState", "") != "not-found"}
 
 
 def can_shutdown(runner=run) -> bool:
