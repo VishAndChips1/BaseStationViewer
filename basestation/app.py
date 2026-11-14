@@ -234,7 +234,10 @@ class BaseStation(QMainWindow):
         # Re-apply any CLI host after populating recent hosts: populating the
         # combo can move the current index and overwrite the editable text.
         self._load_recent_hosts()
-        self.host_combo.setCurrentText(host or "")
+        # No host given on the command line: start on the one used last time, so
+        # the power button and diagnostics have an address to talk to straight away.
+        last_used = self.host_combo.itemData(0) if self.host_combo.count() else ""
+        self.host_combo.setCurrentText(host or last_used or "")
 
         self._show_origin(True)
         self._show_scale_grid(True)
