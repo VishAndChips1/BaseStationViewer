@@ -283,6 +283,11 @@ QLabel#StatValue {{
 }}
 QLabel#StatusLabel {{ color: {TEXT_MUTED}; font-size: {FONT_CALLOUT}px; }}
 QLabel#HintLabel {{ color: {TEXT_FAINT}; font-size: {FONT_FOOTNOTE}px; }}
+QLabel#StreamChip {{
+    color: {TEXT}; font-size: {FONT_CALLOUT}px; font-weight: 500; padding: 0 {SPACE_2}px;
+}}
+QLabel#StreamChip[state="stale"] {{ color: {WARNING}; }}
+QLabel#StreamChip[state="idle"] {{ color: {TEXT_MUTED}; }}
 QLabel#BigReadout {{
     font-size: {FONT_TITLE}px; font-weight: 600; letter-spacing: -0.2px;
 }}

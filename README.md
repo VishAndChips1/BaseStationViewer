@@ -15,7 +15,11 @@ can check on and power the sensor PC. Built on Qt (PySide6) and PyVista/VTK.
 
 ## Features
 
-- **Live 3D cloud** with RGB or thermal colouring, scale grid, origin and orientation axes, and a Home button for the default view
+- **Live 3D cloud** coloured by RGB, thermal or height, with scale grid, origin and orientation axes, and a Home button for the default view
+- **Refresh rate (Hz) next to every point count**: toolbar, status pill, title bar, live stats, filter result and diagnostics. It is measured from the spacing of arriving clouds (steady at 0.4 Hz or 30 Hz), falls to 0 Hz and turns amber when the rig stalls, and a separate *Display rate* shows when this PC is the bottleneck
+- **Open saved clouds** (`.pcd` / `.ply`, binary or ASCII) such as recordings; the live view pauses until you press Resume
+- Shortcuts: `P` pause, `1` `2` `3` tools, `T` top view, `Home` home view, `Ctrl+O` open, `Ctrl+S` save cloud, `Ctrl+Shift+S` screenshot
+- Draws nothing while minimised (recording still runs) and remembers point size and colour mode
 - **Crop** with a draggable 3D box or exact limits; **Measure** distance, slope, path length and plan-view area, with the temperature at each point
 - **Process** every frame live: distance range, temperature band, stray-point removal, voxel thinning (saves and recordings use the result)
 - **Sensor diagnostics**: camera / thermal / lidar connection and fps, pipeline health, and Pi vitals including under-voltage

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from basestation.core import diagnostics
+from basestation.core.rate import format_cloud, format_hz
 from basestation.ui import icons
 from basestation.ui import theme
 from basestation.ui import widgets
@@ -332,10 +333,14 @@ class DiagnosticsDialog(QDialog):
         if not info["connected"]:
             card.add(_row("Stream", "not connected", UNKNOWN))
         else:
-            fps = info["fps"]
-            card.add(_row("Frames received", f"{fps:.1f} fps",
-                           OK if fps >= 1 else ERROR if fps <= 0 else WARN))
-            card.add(_row("Points per frame", f"{info['points']:,}"))
+            hz = info.get("hz", info["fps"])
+            card.add(_row("Refresh rate", format_hz(hz),
+                           UNKNOWN if hz is None else OK if hz >= 1 else ERROR if hz <= 0 else WARN))
+            draw = info.get("render_hz")
+            if draw is not None:
+                card.add(_row("Display rate", format_hz(draw),
+                               WARN if hz and draw < 0.8 * hz else OK))
+            card.add(_row("Points per frame", format_cloud(info["points"], hz)))
             cov = info["thermal_pct"]
             card.add(_row("Thermal coverage",
                            "-" if cov is None else f"{cov:.0f} % of points",

@@ -37,6 +37,7 @@ from vtkmodules.vtkRenderingCore import vtkPointPicker
 
 from basestation import paths
 from basestation.core import control, export, netutil
+from basestation.core.rate import format_cloud, format_hz
 from basestation.ui import icons
 from basestation.core import processing
 from basestation.ui import theme
@@ -55,6 +56,8 @@ CAPTURES_DIR = paths.data_path("captures")
 PANEL_WIDTH = 380
 INVALID_THERMAL_COLOR = (128, 128, 128)  # gray for points with no thermal reading
 THERMAL_COLORMAP = "inferno"
+HEIGHT_COLORMAP = "turbo"
+COLOR_RGB, COLOR_THERMAL, COLOR_HEIGHT = 0, 1, 2
 STATS_REFRESH_MS = 250
 CLICK_SLOP_PX = 5                         # press/release travel still counted as a click
 
@@ -67,6 +70,21 @@ _HT = {
 }
 
 TOOL_TITLES = {"navigate": "Navigate", "crop": "Crop", "measure": "Measure"}
+
+
+def _colormap_lut(name: str) -> np.ndarray:
+    """256 RGB entries (uint8) for a matplotlib colormap."""
+    return (matplotlib.colormaps[name](np.linspace(0.0, 1.0, 256))[:, :3] * 255).astype(np.uint8)
+
+
+def _lookup_colors(values: np.ndarray, lo: float, hi: float, lut: np.ndarray) -> np.ndarray:
+    """Map values onto a 256-entry colour table. Calling a matplotlib colormap
+    on every point of every frame was the slowest part of thermal colouring; a
+    table lookup is a single indexed gather."""
+    span = max(hi - lo, 1e-6)
+    scaled = (values - np.float32(lo)) * np.float32(255.0 / span)
+    np.clip(scaled, 0.0, 255.0, out=scaled)
+    return lut[scaled.astype(np.intp)]
 
 
 def _spin(lo, hi, value, step=0.1, decimals=2, suffix=" m", width=104) -> QDoubleSpinBox:
@@ -119,7 +137,8 @@ class BaseStation(QMainWindow):
         self._bg_custom = False     # user picked their own colour
         self._bg_pixels: np.ndarray | None = None
         self._bg_texture = None
-        self._colormap = matplotlib.colormaps[THERMAL_COLORMAP]
+        self._thermal_lut = _colormap_lut(THERMAL_COLORMAP)
+        self._height_lut = _colormap_lut(HEIGHT_COLORMAP)
         # Persistent buffers handed to VTK -- see _render_view for why these
         # must be owned by the window rather than created per frame.
         self._xyz_buffer: np.ndarray | None = None
@@ -142,6 +161,11 @@ class BaseStation(QMainWindow):
         self._action_worker = None
         self._retired: list = []        # workers still blocked in a network call; see _retire()
         self._rec_fail_streak = 0
+        self._conn_state = "idle"       # last state the poll worker reported
+        self._title_text = None         # title-bar status last drawn (avoids repainting every tick)
+        self._extent_of = None          # the view whose size is shown in the stats
+        self._view_dirty = False        # a frame arrived while minimised and was not drawn
+        self._viewing_file = None       # name of the saved cloud on screen, if any
         self._control_status = None
         self._pending = None            # (action, deadline) while a command is in flight
         self._poweroff_notice = False   # we shut the Pi down; it needs a power-cycle
@@ -217,6 +241,18 @@ class BaseStation(QMainWindow):
         self.readout = widgets.Readout()
         bar.addWidget(self.readout, 1)
 
+        # Always-visible stream summary: how big the cloud is and how often it refreshes.
+        self.stream_chip = QLabel("")
+        self.stream_chip.setObjectName("StreamChip")
+        self.stream_chip.setProperty("state", "idle")
+        self.stream_chip.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.stream_chip.setMinimumWidth(110)
+        # Ignored: a long line is clipped (the tooltip has the detail) instead of
+        # forcing the whole window wider.
+        self.stream_chip.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.stream_chip.setVisible(False)
+        bar.addWidget(self.stream_chip, 1)
+
         self.canvas_overlay = widgets.CanvasOverlay()
         self.canvas_overlay.pause_toggled.connect(self._on_pause_toggled)
         bar.addWidget(self.canvas_overlay)
@@ -249,6 +285,16 @@ class BaseStation(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Z"), self, activated=self._undo_measure_point)
         QShortcut(QKeySequence("Home"), self, activated=self._home_view)
         QShortcut(QKeySequence("Esc"), self, activated=lambda: self.dock.select("navigate"))
+        # Plain letters/digits do not fire while a text box or spin box has focus
+        # (those widgets claim the key first), so typing an IP address is safe.
+        QShortcut(QKeySequence("P"), self, activated=self.canvas_overlay.toggle)
+        QShortcut(QKeySequence("T"), self, activated=self._top_view)
+        for number, tool in (("1", "navigate"), ("2", "crop"), ("3", "measure")):
+            QShortcut(QKeySequence(number), self, activated=lambda t=tool: self.dock.select(t))
+        QShortcut(QKeySequence("Ctrl+O"), self, activated=self._open_cloud)
+        QShortcut(QKeySequence("Ctrl+S"), self, activated=self._save_pcd)
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self, activated=self._save_screenshot)
+        self._load_scene_prefs()
 
         self._stats_timer = QTimer(self)
         self._stats_timer.timeout.connect(self._refresh_stats)
@@ -269,6 +315,8 @@ class BaseStation(QMainWindow):
     def changeEvent(self, event):
         if event.type() == event.Type.WindowStateChange:
             self.title_bar.set_maximized(self.isMaximized())
+            if self._view_dirty and not self.isMinimized():
+                QTimer.singleShot(0, self._refresh_view)      # draw what arrived while hidden
         super().changeEvent(event)
 
     def nativeEvent(self, event_type, message):
@@ -453,6 +501,10 @@ class BaseStation(QMainWindow):
         self.interval_spin = _spin(0.02, 5.0, poll_interval, 0.05, 2, " s")
         self.interval_spin.setToolTip("Minimum time between requests")
         sec.add(widgets.row("Poll interval", self.interval_spin)[0])
+        self.interval_hint = widgets.hint("")
+        sec.add(self.interval_hint)
+        self.interval_spin.valueChanged.connect(self._update_interval_hint)
+        self._update_interval_hint()
 
         self.connect_button = QPushButton("Connect")
         self.connect_button.setObjectName("PrimaryButton")
@@ -463,17 +515,31 @@ class BaseStation(QMainWindow):
         sec.add(self.status_pill)
         return sec
 
+    def _update_interval_hint(self) -> None:
+        interval = self.interval_spin.value()
+        self.interval_hint.setText(
+            f"Asks for a new cloud at most {format_hz(1.0 / interval)}. "
+            "Lower the interval if the rig publishes faster than that.")
+
     def _stats_section(self) -> QWidget:
         sec = widgets.Section("Live stats", "activity")
         rows = {}
-        for key, caption in (("rate", "Data rate"), ("pts_sec", "Points / sec"),
-                              ("count", "Points in frame"), ("fetch", "Fetch time"),
+        for key, caption in (("hz", "Refresh rate"), ("draw_hz", "Display rate"),
+                              ("count", "Points in frame"), ("pts_sec", "Points / sec"),
+                              ("rate", "Data rate"), ("age", "Last frame"),
+                              ("fetch", "Fetch time"), ("extent", "Cloud size"),
                               ("ok", "Frames OK"), ("failed", "Frames failed")):
             w, value = widgets.row(caption)
             sec.add(w)
             rows[key] = value
+        rows["hz"].setToolTip("How often a new cloud arrives from the rig")
+        rows["draw_hz"].setToolTip(
+            "How often a cloud is drawn. Lower than the refresh rate means this PC\n"
+            "cannot keep up: raise the voxel size or turn on a filter to thin the cloud.")
+        self.stat_hz, self.stat_draw_hz = rows["hz"], rows["draw_hz"]
         self.stat_rate, self.stat_points_sec = rows["rate"], rows["pts_sec"]
         self.stat_count, self.stat_fetch = rows["count"], rows["fetch"]
+        self.stat_age, self.stat_extent = rows["age"], rows["extent"]
         self.stat_ok, self.stat_failed = rows["ok"], rows["failed"]
         return sec
 
@@ -701,11 +767,11 @@ class BaseStation(QMainWindow):
         self.size_value_label.setObjectName("StatValue")
         disp.add(self._point_size_row())
 
-        self.color_seg = widgets.Segmented(["RGB camera", "Thermal"])
+        self.color_seg = widgets.Segmented(["RGB", "Thermal", "Height"])
         self.color_seg.changed.connect(lambda _i: self._on_color_mode_changed())
         disp.add(widgets.stacked("Colour overlay", self.color_seg))
 
-        w, self.temp_label = widgets.row("Temperature range", value="n/a")
+        w, self.temp_label = widgets.row("Colour scale", value="n/a")
         disp.add(w)
 
         self.bg_button = QPushButton("  Background")
@@ -739,6 +805,13 @@ class BaseStation(QMainWindow):
         layout.addWidget(ov)
 
         cap = widgets.Section("Capture", "camera")
+        self.open_cloud_button = QPushButton("  Open saved cloud...")
+        theme.bind_icon(self.open_cloud_button, "folder", "text", 15)
+        self.open_cloud_button.setToolTip(
+            "View a .pcd or .ply file (such as a recording). The live view pauses\n"
+            "while it is open; press Resume to go back to the stream.  Ctrl+O")
+        self.open_cloud_button.clicked.connect(self._open_cloud)
+        cap.add(self.open_cloud_button)
         self.save_cloud_button = QPushButton("  Save point cloud...")
         theme.bind_icon(self.save_cloud_button, "download", "text", 15)
         self.save_cloud_button.clicked.connect(self._save_pcd)
@@ -930,6 +1003,8 @@ class BaseStation(QMainWindow):
         widget.style().polish(widget)
 
     def _on_state_changed(self, state: str, detail: str) -> None:
+        self._conn_state = state
+        self._title_text = None
         self.status_pill.set_state(state, detail)
         self.title_bar.set_status(state, detail if state != "live" else "Live")
         self.canvas_overlay.set_live(state == "live")
@@ -1212,7 +1287,8 @@ class BaseStation(QMainWindow):
         last = s["last_frame_time"]
         return {
             "connected": self._worker is not None,
-            "fps": s["fps"], "points": s["point_count"], "thermal_pct": thermal,
+            "fps": s["fps"], "hz": s["hz"], "render_hz": s["render_hz"],
+            "points": s["point_count"], "thermal_pct": thermal,
             "age_s": None if last is None else time.time() - last,
             "kbps": s["kbps"], "failed": s["frames_failed"],
         }
@@ -1309,8 +1385,11 @@ class BaseStation(QMainWindow):
         if not paused:
             self._paused_by_measure = False
             if self._latest_frame is not self._stream_frame and self._stream_frame:
+                self._viewing_file = None
                 self._latest_frame = self._stream_frame
                 self._refresh_view()
+            elif self._viewing_file and self._worker is not None:
+                self._viewing_file = None
 
     def _on_frame_ready(self) -> None:
         """The worker has a new frame in its mailbox; fetch the newest one."""
@@ -1327,13 +1406,22 @@ class BaseStation(QMainWindow):
             # on -- stays exactly as it was when paused.
             return
         self._latest_frame = frame
+        self._viewing_file = None
+        if self.isMinimized() or not self.isVisible():
+            # Nobody can see it: skip the filtering and drawing (the expensive part)
+            # and catch up the moment the window comes back.
+            self._view_dirty = True
+            if self._recorder.active:
+                self._refresh_view(record=True, draw=False)     # recordings must not skip frames
+            return
         self._refresh_view(record=True)
 
-    def _refresh_view(self, record: bool = False) -> None:
+    def _refresh_view(self, record: bool = False, draw: bool = True) -> None:
         """Run the processing pipeline on the current frame and draw it."""
         frame = self._latest_frame
         if frame is None:
             return
+        self._view_dirty = not draw
         if self._tool == "crop" and not self._crop_seeded and frame.num_points:
             self._fit_crop_to_cloud()                 # first data after entering Crop
             self.crop_switch.setChecked(True)         # both re-enter _refresh_view
@@ -1346,7 +1434,10 @@ class BaseStation(QMainWindow):
                          frame.xyz[idx], frame.rgb[idx], frame.temp_c[idx])
         self._view = view
         self._update_process_result(frame.num_points, view.num_points)
-        self._render_view(view)
+        if draw:
+            self._render_view(view)
+            if record:
+                self._stats.record_render()
         if record:
             self._maybe_record(view)
 
@@ -1354,7 +1445,9 @@ class BaseStation(QMainWindow):
         if not self._pipeline.active:
             self.process_result.setText("No filters active.")
         else:
-            self.process_result.setText(f"{after:,} of {before:,} points kept")
+            hz = self._stats.snapshot()["hz"] if self._worker is not None else None
+            self.process_result.setText(
+                f"{after:,} of {before:,} points kept @ {format_hz(hz)}")
 
     def _render_view(self, view: Frame) -> None:
         n = view.num_points
@@ -1388,7 +1481,9 @@ class BaseStation(QMainWindow):
         np.copyto(self._xyz_buffer, view.xyz)
         np.copyto(self._color_buffer, colors)
 
-        if rebuild:
+        if rebuild and self._actor is not None and self._swap_cloud():
+            pass                      # actor kept; only its data changed (the cheap path)
+        elif rebuild:
             if self._actor is not None:
                 self.plotter.remove_actor(self._actor, render=False)
             self._cloud = pv.PolyData(self._xyz_buffer)
@@ -1429,16 +1524,43 @@ class BaseStation(QMainWindow):
         self.plotter.render()
         del old
 
+    def _swap_cloud(self) -> bool:
+        """Point the existing actor at a new cloud of a different size.
+
+        Removing and re-adding an actor for every frame costs about as much as
+        drawing it (a live rig changes its point count almost every frame).
+        Returns False if this VTK/PyVista combination will not allow it, and
+        the caller falls back to rebuilding the actor.
+        """
+        try:
+            cloud = pv.PolyData(self._xyz_buffer)
+            cloud["colors"] = self._color_buffer
+            mapper = self._actor.GetMapper()
+            mapper.SetInputData(cloud)
+            mapper.SelectColorArray("colors")
+            self._cloud = cloud
+            return True
+        except Exception:
+            return False
+
     def _compute_colors(self, frame: Frame) -> np.ndarray:
-        if self.color_seg.index() == 0:
+        mode = self.color_seg.index()
+        if mode == COLOR_RGB:
             self._temp_range = None
             self.temp_label.setText("n/a")
-            rgb = np.clip(np.nan_to_num(frame.rgb, nan=0.5), 0.0, 1.0)
-            return (rgb * 255).astype(np.uint8)
+            scaled = frame.rgb * np.float32(255.0)
+            if not np.isfinite(scaled).all():
+                np.nan_to_num(scaled, copy=False, nan=127.5)
+            np.clip(scaled, 0.0, 255.0, out=scaled)
+            return scaled.astype(np.uint8)
+
+        if mode == COLOR_HEIGHT:
+            return self._height_colors(frame)
 
         temp = frame.temp_c
         valid = np.isfinite(temp)          # inf would make the colour span infinite -> NaN colours
-        colors = np.tile(np.array(INVALID_THERMAL_COLOR, dtype=np.uint8), (len(temp), 1))
+        colors = np.empty((len(temp), 3), dtype=np.uint8)
+        colors[:] = INVALID_THERMAL_COLOR
 
         if not np.any(valid):
             self._temp_range = None
@@ -1449,22 +1571,48 @@ class BaseStation(QMainWindow):
         tmax = float(np.max(temp[valid]))
         self._temp_range = (tmin, tmax)
         self.temp_label.setText(f"{tmin:.1f} to {tmax:.1f} °C")
-
-        span = max(tmax - tmin, 1e-6)
-        norm = np.clip((temp[valid] - tmin) / span, 0.0, 1.0)
-        colors[valid] = (self._colormap(norm)[:, :3] * 255).astype(np.uint8)
+        colors[valid] = _lookup_colors(temp[valid], tmin, tmax, self._thermal_lut)
         return colors
+
+    def _height_colors(self, frame: Frame) -> np.ndarray:
+        """Colour by height (Z), so relief reads at a glance on a bare cloud.
+
+        The scale ignores the top and bottom 0.5 % of a subsample: one stray
+        return 40 m up would otherwise squash everything else into one colour.
+        """
+        z = frame.xyz[:, 2]
+        self._temp_range = None
+        if len(z) == 0:
+            return np.empty((0, 3), dtype=np.uint8)
+        probe = z[:: max(1, len(z) // 20000)]
+        lo, hi = (float(v) for v in np.percentile(probe, (0.5, 99.5)))
+        self.temp_label.setText(f"height {lo:.2f} to {hi:.2f} m")
+        return _lookup_colors(z, lo, hi, self._height_lut)
 
     # -- scene controls ------------------------------------------------------
 
+    def _load_scene_prefs(self) -> None:
+        """Restore the look the user last chose (a corrupt value just means the default)."""
+        def stored(key, default):
+            try:
+                return int(self._settings.value(key, default))
+            except (TypeError, ValueError):
+                return default
+        self.size_slider.setValue(min(12, max(1, stored("point_size", self._point_size))))
+        mode = stored("color_mode", COLOR_RGB)
+        if mode in (COLOR_RGB, COLOR_THERMAL, COLOR_HEIGHT):
+            self.color_seg.set_index(mode)
+
     def _on_point_size_changed(self, value: int) -> None:
         self._point_size = value
+        self._settings.setValue("point_size", value)
         self.size_value_label.setText(str(value))
         if self._actor is not None:
             self._actor.prop.point_size = value
             self.plotter.render()
 
     def _on_color_mode_changed(self) -> None:
+        self._settings.setValue("color_mode", self.color_seg.index())
         if self._latest_frame is not None:
             self._refresh_view()
 
@@ -1828,6 +1976,36 @@ class BaseStation(QMainWindow):
         else:
             self._set_capture_status(f"Could not write {os.path.basename(path)}")
 
+    def _open_cloud(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open point cloud", self._default_capture_dir(),
+            "Point clouds (*.pcd *.ply)")
+        if not path:
+            return
+        name = os.path.basename(path)
+        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            xyz, rgb = export.read_cloud(path)
+        except (OSError, ValueError, MemoryError) as exc:
+            self._set_capture_status(f"Could not open {name}: {str(exc)[:80]}")
+            return
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+        if len(xyz) == 0:
+            self._set_capture_status(f"{name} has no points.")
+            return
+
+        colours = (np.full((len(xyz), 3), 0.72, dtype=np.float32) if rgb is None
+                   else rgb.astype(np.float32) / 255.0)
+        frame = Frame(-1, time.time(), 0.0, np.ascontiguousarray(xyz, dtype=np.float32),
+                      colours, np.full(len(xyz), np.nan, dtype=np.float32))
+        self._viewing_file = name
+        self.canvas_overlay.set_paused(True)            # hold the live stream back
+        self._latest_frame = frame
+        self._camera_fitted = False                     # frame the new cloud
+        self._refresh_view()
+        self._set_capture_status(f"Opened {name}. Press Resume to return to live.")
+
     @staticmethod
     def _write_cloud(path: str, frame: Frame, colors: np.ndarray) -> bool:
         try:
@@ -1918,7 +2096,9 @@ class BaseStation(QMainWindow):
 
         name = f"frame_{self._recorder.saved:05d}_{datetime.now():%Y%m%d_%H%M%S}.pcd"
         path = os.path.join(self._recorder.folder, name)
-        ok = self._write_cloud(path, view, self._color_buffer)
+        # While minimised nothing is drawn, so the colour buffer is stale: recompute.
+        colors = self._compute_colors(view) if self._view_dirty else self._color_buffer
+        ok = self._write_cloud(path, view, colors)
         self._recorder.note_saved(ok)
         self._rec_fail_streak = 0 if ok else self._rec_fail_streak + 1
         if self._rec_fail_streak >= 3:
@@ -1934,17 +2114,97 @@ class BaseStation(QMainWindow):
 
     def _refresh_stats(self) -> None:
         s = self._stats.snapshot()
+        hz = s["hz"] if self._worker is not None else None
+        last = s["last_frame_time"]
+        age = None if last is None else max(0.0, time.time() - last)
+
+        self.stat_hz.setText(format_hz(hz))
+        self.stat_draw_hz.setText(format_hz(s["render_hz"] if self._worker is not None else None))
         self.stat_rate.setText(f"{s['kbps']:.1f} KB/s")
         self.stat_points_sec.setText(f"{s['pts_per_sec']:,.0f}")
         self.stat_count.setText(f"{s['point_count']:,}")
+        self.stat_age.setText("-" if age is None else f"{age:.1f} s ago")
         self.stat_fetch.setText(
             f"{s['fetch_seconds'] * 1000:.0f} ms" if s["fetch_seconds"] else "-")
         self.stat_ok.setText(str(s["frames_received"]))
         self.stat_failed.setText(str(s["frames_failed"]))
+        self._refresh_extent()
+        self._refresh_stream_summary(s, hz, age)
 
         # A recording can outlive its duration if frames stop arriving.
         if self._recorder.expired():
             self._stop_recording("Recording complete.")
+
+    def _refresh_extent(self) -> None:
+        view = self._view
+        if view is self._extent_of:
+            return                                    # same cloud as last tick: nothing to recompute
+        self._extent_of = view
+        box = processing.bounds_of(view.xyz) if view is not None and view.num_points else None
+        if box is None:
+            self.stat_extent.setText("-")
+        else:
+            self.stat_extent.setText(
+                f"{box[1] - box[0]:.1f} x {box[3] - box[2]:.1f} x {box[5] - box[4]:.1f} m")
+
+    def _stale_after(self) -> float:
+        """Seconds without a new frame before the stream is called stale."""
+        return max(3.0, 3.0 * self.interval_spin.value())
+
+    def _refresh_stream_summary(self, s: dict, hz, age) -> None:
+        """Point count + refresh rate, shown beside the toolbar, in the status
+        pill and in the title bar -- always together."""
+        connected = self._worker is not None
+        chip = self.stream_chip
+        if self._viewing_file and self._view is not None:
+            # A saved file has no refresh rate; say so rather than showing a stale one.
+            chip.setText(f"{self._viewing_file}  |  {self._view.num_points:,} pts  |  saved file")
+            if chip.property("state") != "idle":
+                chip.setProperty("state", "idle")
+                self._restyle(chip)
+            chip.setToolTip("Viewing a saved cloud. Press Resume to return to the live stream.")
+            chip.setVisible(True)
+            return
+        if not connected:
+            chip.setVisible(False)
+            return
+
+        stale = age is not None and age > self._stale_after()
+        state = "stale" if stale else ("live" if s["frames_received"] else "idle")
+        if self._conn_state == "error" and s["frames_received"] == 0:
+            chip.setVisible(False)
+            return
+
+        if not s["frames_received"]:
+            text = "Waiting for the first cloud..."
+        else:
+            total = s["point_count"]
+            view = self._view
+            shown = view.num_points if view is not None and self._pipeline.active else total
+            count = f"{shown:,} of {total:,}" if shown != total else f"{total:,}"
+            text = f"{count} pts @ {format_hz(hz)}"
+            if self._view_paused:
+                text = f"Paused  |  {text}"
+            if stale:
+                text += f"  |  no new cloud for {age:.0f} s"
+
+        if chip.text() != text:
+            chip.setText(text)
+        if chip.property("state") != state:
+            chip.setProperty("state", state)
+            self._restyle(chip)
+        chip.setVisible(True)
+        chip.setToolTip(
+            f"Refresh rate: {format_hz(hz)} (new clouds arriving)\n"
+            f"Display rate: {format_hz(s['render_hz'])} (clouds drawn)\n"
+            f"{s['pts_per_sec']:,.0f} points/s, {s['kbps']:.0f} KB/s")
+
+        if self._conn_state == "live" and s["frames_received"]:
+            self.status_pill.set_text("Live - " + format_cloud(s["point_count"], hz))
+            title = f"Live - {format_hz(hz)}" if not stale else "Live - no new cloud"
+            if title != self._title_text:
+                self._title_text = title
+                self.title_bar.set_status("live", title)
 
     # -- lifecycle -------------------------------------------------------
 

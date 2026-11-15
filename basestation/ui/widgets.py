@@ -264,6 +264,10 @@ class StatusPill(QFrame):
             self._pulse.stop()
         self._paint_dot(1.0)
 
+    def set_text(self, text: str) -> None:
+        """Change the wording only (no state change); safe to call every tick."""
+        self._label.setText(text)
+
     def _toggle_pulse(self) -> None:
         self._pulse_on = not self._pulse_on
         self._paint_dot(1.0 if self._pulse_on else 0.3)
