@@ -56,7 +56,7 @@ fi
 say "1/5  Installing the control service"
 mkdir -p "$APP_DIR" "$TOKEN_DIR" "$UNIT_DIR"
 chmod 700 "$TOKEN_DIR"
-cat > "$APP_DIR/pitfusion_control.py" <<'PITFUSION_CONTROL_PY_EOF'
+cat > "$APP_DIR/pitfusion_control.py.new" <<'PITFUSION_CONTROL_PY_EOF'
 #!/usr/bin/env python3
 """Always-on power/control daemon for the PitFusion3D sensor PC.
 
@@ -277,6 +277,14 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 PITFUSION_CONTROL_PY_EOF
+# If a different version is already installed (for example one edited on this Pi),
+# keep a copy instead of silently replacing it.
+if [ -f "$APP_DIR/pitfusion_control.py" ] && ! cmp -s "$APP_DIR/pitfusion_control.py.new" "$APP_DIR/pitfusion_control.py"; then
+    BACKUP="$APP_DIR/pitfusion_control.py.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -p "$APP_DIR/pitfusion_control.py" "$BACKUP"
+    warn "a different control service was already installed; its copy is kept at $BACKUP"
+fi
+mv -f "$APP_DIR/pitfusion_control.py.new" "$APP_DIR/pitfusion_control.py"
 chmod 755 "$APP_DIR/pitfusion_control.py"
 python3 -m py_compile "$APP_DIR/pitfusion_control.py"
 

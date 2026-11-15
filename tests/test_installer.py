@@ -104,6 +104,25 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("visudo -cf /etc/sudoers.d/pitfusion3d-poweroff", calls)   # validated, not trusted
         self.assertIn("8081", r.stdout)
 
+    def test_a_different_installed_service_is_backed_up_not_silently_replaced(self):
+        """The Pi's own copy can carry features the repo lacks; never lose it."""
+        self.run_installer()
+        daemon = self.home / ".local/share/pitfusion3d-control/pitfusion_control.py"
+        daemon.write_text("# edited on the Pi: has can_sleep and full_poweroff\n")
+        r = self.run_installer()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        backups = list(daemon.parent.glob("pitfusion_control.py.bak-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn("full_poweroff", backups[0].read_text())
+        self.assertIn("kept at", r.stdout + r.stderr)
+
+    def test_rerunning_with_an_identical_service_makes_no_backup(self):
+        self.run_installer()
+        self.run_installer()
+        daemon_dir = self.home / ".local/share/pitfusion3d-control"
+        self.assertEqual(list(daemon_dir.glob("pitfusion_control.py.bak-*")), [])
+        self.assertEqual(list(daemon_dir.glob("*.new")), [])
+
     def test_the_sudo_rule_grants_poweroff_and_nothing_else(self):
         self.run_installer()
         rule = Path(str(self.log) + ".sudoers_rule").read_text()

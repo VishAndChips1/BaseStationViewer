@@ -97,6 +97,26 @@ usually the reason (the stream's port 8080 may be open while 8081 is not). The a
 you which case it is: "nothing is listening on port 8081" means the service is not
 running; "no reply ... firewall" means the port is blocked or the address is wrong.
 
+### If the stream is slow or the Pi's pings jump around: turn off WiFi power-save
+
+A Pi joined to a router's WiFi puts its radio to sleep between packets, which shows up
+as pings that swing between a few ms and a second with no packet loss, and clouds that
+take seconds to download. One command, on the Pi, changes only that setting and makes it
+permanent (it does not touch the control service or the pipeline):
+
+```bash
+curl -4 -fL --connect-timeout 10 --max-time 60 -o pi_wifi_tune.sh \
+    https://raw.githubusercontent.com/VishAndChips1/GroundStation3D/main/sensor_side/pi_wifi_tune.sh
+bash pi_wifi_tune.sh
+```
+
+It prints latency to the router before and after. It does nothing when the Pi is the
+hotspot itself (power-save only applies to a Pi that has joined another network).
+
+> `pi_setup.sh` replaces the installed control service with the one in this repo. If you
+> have edited the service on the Pi, the installer now keeps a timestamped
+> `pitfusion_control.py.bak-...` copy rather than silently overwriting it.
+
 ### Powering **on** is not possible over WiFi
 
 A Raspberry Pi that has shut down has no network at all, and when the Pi *is* the WiFi
