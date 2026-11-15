@@ -12,6 +12,7 @@ from PySide6.QtCore import QThread, Signal
 
 from basestation.core import discovery
 from basestation.core.protocol import MalformedFrameError, parse_frame
+from basestation.core.quality import AUTO_BUDGET_S, choose_level, parse_levels
 from basestation.core.rate import RateMeter
 
 # Generous by default: over real WiFi a full-resolution frame can be several
@@ -122,16 +123,31 @@ class PollWorker(QThread):
 
     frame_ready = Signal()
     state_changed = Signal(str, str)  # state ("live"/"connecting"/"error"), detail
+    levels_found = Signal(list)       # point counts the rig can send (X-Quality-Levels)
+    level_changed = Signal(int)       # Auto picked a new size
 
     MAX_BACKOFF = 2.0
+    AUTO = "auto"
 
     def __init__(self, url: str, poll_interval: float, stats: NetworkStats,
-                 timeout: float = DEFAULT_FETCH_TIMEOUT):
+                 timeout: float = DEFAULT_FETCH_TIMEOUT, quality=None, start_level=None):
+        """quality: None = whatever the rig sends by default, an int = ask for
+        that many points, "auto" = adapt to the speed of the link.
+        start_level: where Auto begins (the size it settled on last time), so a
+        weak link does not have to download one full-size cloud to find out."""
         super().__init__()
         self._url = url
         self._poll_interval = poll_interval
         self._timeout = timeout
         self._stats = stats
+        self._quality = quality
+        self.auto_budget = AUTO_BUDGET_S      # target seconds per download in Auto mode
+        self._levels: list[int] = []
+        self._level = quality if isinstance(quality, int) else (
+            start_level if quality == self.AUTO else None)     # the size currently being requested
+        self._throughput = None          # smoothed bytes/s of recent downloads
+        self._pending_level = None       # a proposed change, awaiting confirmation
+        self._level_votes = 0
         self._stop_event = threading.Event()
         self._last_state = None
         self._lock = threading.Lock()
@@ -146,6 +162,54 @@ class PollWorker(QThread):
         with self._lock:
             frame, self._latest, self._signalled = self._latest, None, False
         return frame
+
+    def set_quality(self, quality) -> None:
+        """Change what is requested (None, a point count, or "auto") while running."""
+        if quality == self._quality:
+            return                         # already so: keep what Auto has learned
+        self._quality = quality
+        self._level = quality if isinstance(quality, int) else None
+        self._pending_level, self._level_votes = None, 0
+        self._etag = None                  # a different size is a different resource
+
+    @property
+    def current_level(self):
+        """Point count currently being requested, or None for the rig's default."""
+        return self._level
+
+    def _request_url(self) -> str:
+        level = self._level
+        if level is None:
+            return self._url
+        return f"{self._url}{'&' if '?' in self._url else '?'}n={level}"
+
+    def _learn_levels(self, header) -> None:
+        levels = parse_levels(header)
+        if levels and levels != self._levels:
+            self._levels = levels
+            self.levels_found.emit(levels)
+
+    def _adapt(self, nbytes: int, npoints: int, fetch_seconds: float) -> None:
+        """Auto mode: after each frame, decide whether a different size would
+        keep downloads inside the time budget. A change needs two agreeing
+        frames in a row, so one slow packet does not shrink the picture."""
+        if self._quality != self.AUTO or not self._levels or npoints <= 0:
+            return
+        sample = nbytes / max(fetch_seconds, 0.02)
+        self._throughput = sample if self._throughput is None else 0.5 * self._throughput + 0.5 * sample
+        wanted = choose_level(self._levels, nbytes / npoints, self._throughput, self._level,
+                              self.auto_budget)
+        if wanted == self._level or wanted is None:
+            self._pending_level, self._level_votes = None, 0
+            return
+        if wanted == self._pending_level:
+            self._level_votes += 1
+        else:
+            self._pending_level, self._level_votes = wanted, 1
+        if self._level is None or self._level_votes >= 2:
+            self._level, self._pending_level, self._level_votes = wanted, None, 0
+            self._etag = None
+            self.level_changed.emit(wanted)
 
     def stop(self) -> None:
         """Ask the thread to finish. A download in progress notices within
@@ -173,11 +237,12 @@ class PollWorker(QThread):
         headers = {"Accept-Encoding": "gzip"}
         if self._etag:
             headers["If-None-Match"] = self._etag      # lets the rig answer 304
-        req = urllib.request.Request(self._url, headers=headers)
+        req = urllib.request.Request(self._request_url(), headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 data = self._read_body(resp)
                 self._etag = resp.headers.get("ETag") or self._etag
+                self._learn_levels(resp.headers.get("X-Quality-Levels"))
         except urllib.error.HTTPError as exc:
             if exc.code == 304:
                 raise _NotModified() from None
@@ -270,6 +335,7 @@ class PollWorker(QThread):
                 self._stats.record_frame(len(data), frame.num_points, fetch_seconds)
                 self._emit_state("live", "Live")      # the GUI adds the point count and refresh rate
                 self._post(frame)
+                self._adapt(len(data), frame.num_points, fetch_seconds)
             self._rest(start, failures)
 
     def _fail(self, detail: str) -> None:

@@ -30,6 +30,7 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
@@ -188,27 +189,54 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # keep the console quiet
 
-    def _serve_rig(self):
+    throttle_kbps = 0           # simulate a slow WiFi link (0 = unlimited)
+    QUALITY_LEVELS = (8000, 20000, 40000, 60000, 80000)   # like the real rig's X-Quality-Levels
+
+    def _level(self, query: str) -> int:
+        """`?n=` snaps to a supported level; anything unusable means full detail
+        (what the real rig does)."""
+        top = min(self.points_per_frame, self.QUALITY_LEVELS[-1])
+        try:
+            want = int(parse_qs(query).get("n", [""])[0])
+        except ValueError:
+            return top
+        for level in self.QUALITY_LEVELS:
+            if want <= level:
+                return min(level, top)
+        return top
+
+    def _write_throttled(self, body: bytes) -> None:
+        if not self.throttle_kbps:
+            self.wfile.write(body)
+            return
+        step = max(1024, int(self.throttle_kbps * 1024 / 20))     # 20 slices a second
+        for i in range(0, len(body), step):
+            self.wfile.write(body[i:i + step])
+            time.sleep(0.05)
+
+    def _serve_rig(self, query: str = ""):
         seq = int(time.time())                       # a new frame once a second
+        n = self._level(query)
         etag = f'"{seq}"'
         if self.headers.get("If-None-Match") == etag:
             self.send_response(304)
             self.send_header("ETag", etag)
             self.end_headers()
             return
-        cached_seq, body = Handler._rig_cache
-        if cached_seq != seq:
+        cached, body = Handler._rig_cache
+        if cached != (seq, n):
             pts = (make_terrain_points if self.scene == "terrain" else make_frame_points)(
-                self.points_per_frame, time.time())
+                n, time.time())
             body = encode_rig_frame(pts["xyz"], pts["rgb"], pts["thermal_k"], seq, gzip_it=True)
-            Handler._rig_cache = (seq, body)
+            Handler._rig_cache = ((seq, n), body)
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("ETag", etag)
+        self.send_header("X-Quality-Levels", ",".join(str(v) for v in self.QUALITY_LEVELS))
         self.end_headers()
-        self.wfile.write(body)
+        self._write_throttled(body)
 
     def do_GET(self):
         if SYSTEMD.state != "active":      # pipeline stopped: nothing is served
@@ -224,13 +252,14 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if self.path != "/latest.bin":
+        route = urlsplit(self.path)
+        if route.path != "/latest.bin":
             self.send_response(404)
             self.end_headers()
             return
 
         if self.wire == "rig":
-            return self._serve_rig()
+            return self._serve_rig(route.query)
 
         points = (make_terrain_points if self.scene == "terrain" else make_frame_points)(
             self.points_per_frame, time.time())
@@ -252,6 +281,8 @@ def main():
                         help="synthetic scene to serve (terrain is handy for screenshots)")
     parser.add_argument("--wire", choices=("float32", "rig"), default="float32",
                         help="body layout: plain float32, or the rig's gzip+quantized+ETag format")
+    parser.add_argument("--throttle-kbps", type=float, default=0,
+                        help="limit the download speed to imitate a weak WiFi link")
     parser.add_argument("--no-diagnostics", action="store_true",
                         help="answer /diagnostics with 404, like an un-upgraded sensor PC")
     parser.add_argument("--control-port", type=int, default=8081,
@@ -263,6 +294,7 @@ def main():
     Handler.scene = args.scene
     Handler.wire = args.wire
     Handler.diagnostics_enabled = not args.no_diagnostics
+    Handler.throttle_kbps = args.throttle_kbps
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     SERVERS.append(server)
     if args.control_port:

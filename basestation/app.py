@@ -506,6 +506,15 @@ class BaseStation(QMainWindow):
         self.interval_spin.valueChanged.connect(self._update_interval_hint)
         self._update_interval_hint()
 
+        self.detail_combo = QComboBox()
+        self.detail_combo.setToolTip(
+            "How many points to ask the rig for.\n"
+            "Auto keeps each download under about a second, so a weak WiFi link\n"
+            "gives a smooth thinner cloud instead of a slow full one.")
+        self._fill_detail_combo([])
+        self.detail_combo.activated.connect(self._on_detail_chosen)
+        sec.add(widgets.stacked("Detail", self.detail_combo))
+
         self.connect_button = QPushButton("Connect")
         self.connect_button.setObjectName("PrimaryButton")
         self.connect_button.clicked.connect(self._toggle_connection)
@@ -514,6 +523,52 @@ class BaseStation(QMainWindow):
         self.status_pill = widgets.StatusPill()
         sec.add(self.status_pill)
         return sec
+
+    # -- detail (how many points the rig is asked for) ---------------------
+
+    def _stored_detail(self):
+        """Saved choice: "auto" (default), an int, or None for the rig's default."""
+        raw = str(self._settings.value("detail", "auto"))
+        if raw == "full":
+            return None
+        return int(raw) if raw.isdigit() else PollWorker.AUTO
+
+    def _fill_detail_combo(self, levels: list) -> None:
+        wanted = self._stored_detail()
+        combo = self.detail_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Auto (match the link speed)", PollWorker.AUTO)
+        if not levels:
+            combo.addItem("Rig default", None)
+        for i, level in enumerate(levels):
+            tag = "  (full)" if i == len(levels) - 1 else ""
+            combo.addItem(f"{level:,} points{tag}", level)
+        if wanted is None and levels:
+            wanted = levels[-1]                       # "rig default" is the top size
+        index = next((i for i in range(combo.count()) if combo.itemData(i) == wanted), 0)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+    def _on_detail_chosen(self, _index: int = 0) -> None:
+        value = self.detail_combo.currentData()
+        self._settings.setValue("detail", "full" if value is None else str(value))
+        if self._worker is not None:
+            self._worker.set_quality(value)
+
+    def _last_auto_level(self):
+        raw = str(self._settings.value("auto_level", ""))
+        return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+    def _on_auto_level(self, level: int) -> None:
+        if self.sender() is self._worker:
+            self._settings.setValue("auto_level", level)
+
+    def _on_levels_found(self, levels: list) -> None:
+        if self.sender() is not self._worker:
+            return                                    # a retired worker's late signal
+        self._fill_detail_combo(levels)
+        self._worker.set_quality(self.detail_combo.currentData())
 
     def _update_interval_hint(self) -> None:
         interval = self.interval_spin.value()
@@ -527,7 +582,8 @@ class BaseStation(QMainWindow):
         for key, caption in (("hz", "Refresh rate"), ("draw_hz", "Display rate"),
                               ("count", "Points in frame"), ("pts_sec", "Points / sec"),
                               ("rate", "Data rate"), ("age", "Last frame"),
-                              ("fetch", "Fetch time"), ("extent", "Cloud size"),
+                              ("fetch", "Fetch time"), ("detail", "Detail asked for"),
+                              ("extent", "Cloud size"),
                               ("ok", "Frames OK"), ("failed", "Frames failed")):
             w, value = widgets.row(caption)
             sec.add(w)
@@ -540,6 +596,7 @@ class BaseStation(QMainWindow):
         self.stat_rate, self.stat_points_sec = rows["rate"], rows["pts_sec"]
         self.stat_count, self.stat_fetch = rows["count"], rows["fetch"]
         self.stat_age, self.stat_extent = rows["age"], rows["extent"]
+        self.stat_detail = rows["detail"]
         self.stat_ok, self.stat_failed = rows["ok"], rows["failed"]
         return sec
 
@@ -970,7 +1027,11 @@ class BaseStation(QMainWindow):
         self._remember_host(host)
 
         self._worker = PollWorker(url, self.interval_spin.value(), self._stats,
-                                   timeout=self._timeout)
+                                   timeout=self._timeout,
+                                   quality=self.detail_combo.currentData(),
+                                   start_level=self._last_auto_level())
+        self._worker.levels_found.connect(self._on_levels_found)
+        self._worker.level_changed.connect(self._on_auto_level)
         self._worker.frame_ready.connect(self._on_frame_ready)
         self._worker.state_changed.connect(self._on_state_changed)
         self._worker.start()
@@ -2128,6 +2189,8 @@ class BaseStation(QMainWindow):
             f"{s['fetch_seconds'] * 1000:.0f} ms" if s["fetch_seconds"] else "-")
         self.stat_ok.setText(str(s["frames_received"]))
         self.stat_failed.setText(str(s["frames_failed"]))
+        level = self._worker.current_level if self._worker is not None else None
+        self.stat_detail.setText("rig default" if level is None else f"{level:,} points")
         self._refresh_extent()
         self._refresh_stream_summary(s, hz, age)
 

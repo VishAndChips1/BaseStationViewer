@@ -17,6 +17,7 @@ can check on and power the sensor PC. Built on Qt (PySide6) and PyVista/VTK.
 
 - **Live 3D cloud** coloured by RGB, thermal or height, with scale grid, origin and orientation axes, and a Home button for the default view
 - **Refresh rate (Hz) next to every point count**: toolbar, status pill, title bar, live stats, filter result and diagnostics. It is measured from the spacing of arriving clouds (steady at 0.4 Hz or 30 Hz), falls to 0 Hz and turns amber when the rig stalls, and a separate *Display rate* shows when this PC is the bottleneck
+- **Detail (Auto)**: the rig can send thinned clouds (`/latest.bin?n=20000`, sizes from its `X-Quality-Levels` header). Auto keeps each download under about a second, so a weak WiFi link gives a steady thinner cloud instead of a slow full one; it remembers the size for next time. Or pick a size yourself
 - **Open saved clouds** (`.pcd` / `.ply`, binary or ASCII) such as recordings; the live view pauses until you press Resume
 - Shortcuts: `P` pause, `1` `2` `3` tools, `T` top view, `Home` home view, `Ctrl+O` open, `Ctrl+S` save cloud, `Ctrl+Shift+S` screenshot
 - Draws nothing while minimised (recording still runs) and remembers point size and colour mode
@@ -44,7 +45,7 @@ No rig? Run a stand-in and connect to `127.0.0.1`:
 python tools/mock_rover_server.py --scene terrain --wire rig --token demo
 ```
 
-It serves a cloud (`--wire rig` uses the rig's real gzip format), simulated diagnostics, and the real control daemon over a fake systemd.
+It serves a cloud (`--wire rig` uses the rig's real gzip format and quality levels), simulated diagnostics, and the real control daemon over a fake systemd. `--throttle-kbps 150` imitates a weak WiFi link.
 
 ## Sensor PC
 

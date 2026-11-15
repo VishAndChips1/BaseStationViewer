@@ -4,6 +4,7 @@ import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -13,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from basestation.core import export                         # noqa: E402
+from basestation.core.quality import choose_level, parse_levels   # noqa: E402
 from basestation.core.rate import RateMeter, format_cloud, format_hz   # noqa: E402
 from basestation.net.workers import NetworkStats            # noqa: E402
 
@@ -102,6 +104,150 @@ class NetworkStatsHzTests(unittest.TestCase):
             s.record_frame(1000, 50, 0.01)
         s.reset()
         self.assertIsNone(s.snapshot()["hz"])
+
+
+class QualityChoiceTests(unittest.TestCase):
+    LEVELS = [8000, 20000, 40000, 60000, 80000]
+    BPP = 8.3                                       # bytes per point, as measured on the rig
+
+    def test_parse_levels_ignores_junk(self):
+        self.assertEqual(parse_levels("8000, 20000,40000"), [8000, 20000, 40000])
+        self.assertEqual(parse_levels("abc,,-5,0,9,3,3"), [3, 9])
+        self.assertEqual(parse_levels(None), [])
+        self.assertEqual(parse_levels("99999999999"), [])
+
+    def test_fast_link_gets_full_detail(self):
+        self.assertEqual(choose_level(self.LEVELS, self.BPP, 5_000_000), 80000)
+
+    def test_slow_link_gets_a_thin_cloud(self):
+        # 150 KB/s (what the rig's WiFi managed): 20,000 points ~ 1.1 s, 8,000 ~ 0.44 s
+        self.assertEqual(choose_level(self.LEVELS, self.BPP, 150_000), 8000)
+
+    def test_hopeless_link_still_returns_the_smallest_not_nothing(self):
+        self.assertEqual(choose_level(self.LEVELS, self.BPP, 1_000), 8000)
+
+    def test_steps_down_when_over_budget_and_up_only_with_headroom(self):
+        # at 300 KB/s: 20,000 points take 0.55 s, 40,000 take 1.1 s (over the 1 s budget)
+        self.assertEqual(choose_level(self.LEVELS, self.BPP, 300_000, current=80000), 20000)
+        self.assertEqual(choose_level(self.LEVELS, self.BPP, 300_000, current=40000), 20000)
+        # 20,000 fits, and 40,000 would not fit in 60% of the budget: stay put
+        self.assertEqual(choose_level(self.LEVELS, self.BPP, 300_000, current=20000), 20000)
+        # a clearly faster link (600 KB/s: 40,000 take 0.55 s) earns a step up
+        self.assertEqual(choose_level(self.LEVELS, self.BPP, 600_000, current=20000), 40000)
+
+    def test_no_levels_or_no_measurement_is_harmless(self):
+        self.assertIsNone(choose_level([], self.BPP, 100_000))
+        self.assertEqual(choose_level(self.LEVELS, 0, 100_000, current=20000), 20000)
+        self.assertEqual(choose_level(self.LEVELS, self.BPP, 0), 8000)
+
+
+try:
+    from PySide6.QtCore import QCoreApplication, Qt
+    from basestation.net.workers import PollWorker
+    HAVE_QT = True
+except ImportError:                                           # pragma: no cover
+    HAVE_QT = False
+
+sys.path.insert(0, str(ROOT / "tests"))
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 not installed")
+class AutoDetailTests(unittest.TestCase):
+    """The worker asks for `?n=`, learns the rig's levels, and adapts to the link."""
+
+    LEVELS = "200,500,1000,2000"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QCoreApplication.instance() or QCoreApplication([])
+
+    def start(self, quality, rate_bytes_per_s=None, budget=None):
+        import test_robustness as tr
+        self.asked = []
+
+        def respond(h):
+            query = h.path.partition("?")[2]
+            self.asked.append(query)
+            want = int(query[2:]) if query.startswith("n=") and query[2:].isdigit() else 2000
+            n = min(l for l in (200, 500, 1000, 2000) if l >= want) if want <= 2000 else 2000
+            rng = np.random.default_rng(n)
+            xyz = rng.uniform(-5, 5, (n, 3)).astype(np.float32)
+            body = tr.protocol.encode_rig_frame(
+                xyz, rng.random((n, 3)).astype(np.float32), np.full(n, 300.0, np.float32), gzip_it=False)
+            if rate_bytes_per_s:
+                time.sleep(len(body) / rate_bytes_per_s)
+            tr.send(h, body, headers={"X-Quality-Levels": self.LEVELS})
+
+        srv = tr.Server(respond)
+        self.addCleanup(srv.close)
+        w = PollWorker(f"http://127.0.0.1:{srv.port}/latest.bin", 0.02, NetworkStats(),
+                       timeout=5.0, quality=quality)
+        if budget:
+            w.auto_budget = budget
+        self.found = []
+        w.levels_found.connect(self.found.append, Qt.DirectConnection)
+        w.start()
+        self.addCleanup(lambda: (w.stop(), w.wait(3000)))
+        return w
+
+    @staticmethod
+    def wait_for(cond, timeout=15.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cond():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_fixed_level_is_sent_and_levels_are_learned(self):
+        w = self.start(500)
+        w.set_quality(500)
+        self.assertTrue(self.wait_for(lambda: self.found and "n=500" in self.asked))
+        self.assertEqual(self.found[0], [200, 500, 1000, 2000])
+        self.assertEqual(w.current_level, 500)
+
+    def test_auto_settles_on_full_detail_when_the_link_is_fast(self):
+        w = self.start(PollWorker.AUTO)
+        self.assertTrue(self.wait_for(lambda: w.current_level == 2000))
+        time.sleep(0.5)
+        self.assertEqual(w.current_level, 2000)                 # and stays there
+
+    def test_auto_drops_to_a_thin_cloud_on_a_slow_link(self):
+        w = self.start(PollWorker.AUTO, rate_bytes_per_s=8000, budget=0.3)
+        self.assertTrue(self.wait_for(lambda: w.current_level == 200),
+                        f"stuck at {w.current_level}; asked {self.asked[-5:]}")
+
+    def test_auto_begins_at_the_remembered_size_not_a_full_cloud(self):
+        """On a weak link the first full-size download was the slowest thing the app did."""
+        import test_robustness as tr
+        asked = []
+
+        def respond(h):
+            asked.append(h.path.partition("?")[2])
+            tr.send(h, tr.protocol.encode_rig_frame(
+                np.zeros((10, 3), np.float32), np.zeros((10, 3), np.float32),
+                np.full(10, 300.0, np.float32)), headers={"X-Quality-Levels": self.LEVELS})
+
+        srv = tr.Server(respond)
+        self.addCleanup(srv.close)
+        w = PollWorker(f"http://127.0.0.1:{srv.port}/latest.bin", 0.02, NetworkStats(),
+                       quality=PollWorker.AUTO, start_level=500)
+        w.start()
+        self.addCleanup(lambda: (w.stop(), w.wait(3000)))
+        self.assertTrue(self.wait_for(lambda: bool(asked)))
+        self.assertEqual(asked[0], "n=500")
+
+    def test_reasserting_the_same_mode_does_not_forget_what_auto_learned(self):
+        w = self.start(PollWorker.AUTO)
+        self.assertTrue(self.wait_for(lambda: w.current_level == 2000))
+        w.set_quality(PollWorker.AUTO)
+        self.assertEqual(w.current_level, 2000)
+
+    def test_switching_to_a_fixed_level_while_running_takes_effect(self):
+        w = self.start(PollWorker.AUTO)
+        self.assertTrue(self.wait_for(lambda: bool(self.found)))
+        w.set_quality(200)
+        self.assertTrue(self.wait_for(lambda: self.asked and self.asked[-1] == "n=200"))
 
 
 def _tmp(name):
