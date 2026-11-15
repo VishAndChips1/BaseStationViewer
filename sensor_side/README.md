@@ -122,9 +122,17 @@ nothing inside the pipeline could ever receive the following "start".
 | faint | Pi unreachable / no control service | explains why on the Rover tab |
 
 **Power off** always shows a warning first: the Pi cannot be switched back on
-from the app. Someone has to power-cycle it (disconnect and reconnect its
-power). After a power-off the app shows "powered off" and keeps saying so
-until the Pi answers again.
+from the app. Someone has to press the Pi's power button (or disconnect and
+reconnect its power). After a power-off the app shows "shut down" and keeps
+saying so until the Pi answers again.
+
+**What "off" means on a Raspberry Pi 5.** A software shutdown leaves the board in a
+low-power *halt* state, not fully off: the red light stays on, the 5V rail and USB
+ports stay powered, and anything powered from them (or from a separate supply, like
+the lidar) keeps running. To get closer to truly off, set `POWER_OFF_ON_HALT=1` in
+the bootloader (`sudo rpi-eeprom-config --edit`): on a Pi 5 that switches off all
+PMIC outputs on halt (per Raspberry Pi's bootloader documentation), and the power
+button still starts it. Cutting the power feed is the only way to get to zero.
 
 ### Install
 

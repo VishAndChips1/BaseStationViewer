@@ -1092,10 +1092,11 @@ class BaseStation(QMainWindow):
         }
         tip = tips.get(state, "")
         if state == control.OFFLINE and self._poweroff_notice:
-            tip = "Powered off - power-cycle the Raspberry Pi to turn it back on"
+            tip = "Shut down - press the Raspberry Pi's power button to turn it back on"
             self._set_power_hint(
-                "The Raspberry Pi is powered off. Power-cycle it (disconnect and "
-                "reconnect its power) to turn it back on.")
+                "The Raspberry Pi has shut down. To turn it back on, press the power "
+                "button on the board (next to the USB-C port), or disconnect and "
+                "reconnect its power.")
         elif state == control.OFFLINE and not self._current_host():
             tip = "Enter the rover's address on the Rover tab first"
         self.power_button.setToolTip(tip)
@@ -1113,8 +1114,8 @@ class BaseStation(QMainWindow):
         if state == control.OFFLINE:
             self._show_tab(0)
             self._set_power_hint(
-                "The Raspberry Pi is not answering. If it was powered off, it has "
-                "to be power-cycled by hand to turn it back on."
+                "The Raspberry Pi is not answering. If it was shut down, press the "
+                "power button on the board to turn it back on."
                 if self._poweroff_notice else
                 (st.detail if st is not None and st.detail else
                  "The sensor PC is not answering the control port."))
@@ -1155,9 +1156,12 @@ class BaseStation(QMainWindow):
         box.setWindowTitle("Power off the Raspberry Pi?")
         box.setText("<b>Power off the Raspberry Pi?</b>")
         box.setInformativeText(
-            "This shuts the Pi down completely, and the live point-cloud stream will stop.\n\n"
-            "It cannot be turned back on from this app. Someone has to power-cycle it "
-            "- disconnect and reconnect its power - before it will start again.")
+            "This shuts the Pi down, and the live point-cloud stream will stop.\n\n"
+            "It cannot be turned back on from this app. Someone has to press the power "
+            "button on the Pi (or disconnect and reconnect its power) before it will "
+            "start again.\n\n"
+            "The board stays in a low-power standby afterwards (its light stays on), and "
+            "anything powered separately, such as the lidar, keeps running.")
         off = box.addButton("Power off", QMessageBox.DestructiveRole)
         off.setObjectName("DestructiveButton")
         cancel = box.addButton("Cancel", QMessageBox.RejectRole)
@@ -1188,8 +1192,8 @@ class BaseStation(QMainWindow):
             return
         if action == "shutdown":
             self._set_power_hint(
-                "Powering off. Once it has stopped, power-cycle the Raspberry Pi to "
-                "turn it back on.")
+                "Powering off. Once it has stopped, press the power button on the "
+                "Raspberry Pi to turn it back on.")
             if self._worker is not None:
                 self._disconnect()
         self._control.poll_now()

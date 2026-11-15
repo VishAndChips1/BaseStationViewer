@@ -19,7 +19,7 @@ can check on and power the sensor PC. Built on Qt (PySide6) and PyVista/VTK.
 - **Crop** with a draggable 3D box or exact limits; **Measure** distance, slope, path length and plan-view area, with the temperature at each point
 - **Process** every frame live: distance range, temperature band, stray-point removal, voxel thinning (saves and recordings use the result)
 - **Sensor diagnostics**: camera / thermal / lidar connection and fps, pipeline health, and Pi vitals including under-voltage
-- **Power button**: start, stop or restart the sensor pipeline, or power the Pi off (with a warning that it must then be power-cycled by hand)
+- **Power button**: start, stop or restart the sensor pipeline, or power the Pi off (with a warning that its power button is then needed to turn it back on)
 - **Scan for senders** on the local network, **record** frames on an interval, **save** clouds and screenshots
 - **Light, Dark or System** appearance (toggle in the title bar)
 
