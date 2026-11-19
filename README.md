@@ -39,6 +39,8 @@ python -m basestation           # or double-click "Run Base Station.bat"
 
 Press **Scan for senders**, pick the rover, then **Connect**. Python 3.10+.
 
+On Windows, clone or unzip into a short path (for example `C:\BaseStation`): Qt's files are deeply nested and `pip install` fails when the folder path is already very long.
+
 No rig? Run a stand-in and connect to `127.0.0.1`:
 
 ```bash
