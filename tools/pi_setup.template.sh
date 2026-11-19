@@ -5,7 +5,7 @@
 # Pi off over WiFi. Run ON THE PI, as your normal user (not root):
 #
 #     curl -4 -fL --connect-timeout 10 --max-time 60 -o pi_setup.sh \
-#         https://raw.githubusercontent.com/VishAndChips1/GroundStation3D/main/sensor_side/pi_setup.sh
+#         https://raw.githubusercontent.com/VishAndChips1/BaseStationViewer/main/sensor_side/pi_setup.sh
 #     bash pi_setup.sh
 #
 # (Download first, then run: piping curl into bash hides a stalled download and lets

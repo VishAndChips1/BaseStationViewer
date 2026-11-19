@@ -82,7 +82,7 @@ Run this **on the Raspberry Pi** as your normal user (not root). It needs only t
 Pi's internet access and `sudo`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/VishAndChips1/GroundStation3D/main/sensor_side/pi_setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/VishAndChips1/BaseStationViewer/main/sensor_side/pi_setup.sh | bash
 ```
 
 It installs the control service (runs at boot, no login needed), opens port 8081 in
@@ -106,7 +106,7 @@ permanent (it does not touch the control service or the pipeline):
 
 ```bash
 curl -4 -fL --connect-timeout 10 --max-time 60 -o pi_wifi_tune.sh \
-    https://raw.githubusercontent.com/VishAndChips1/GroundStation3D/main/sensor_side/pi_wifi_tune.sh
+    https://raw.githubusercontent.com/VishAndChips1/BaseStationViewer/main/sensor_side/pi_wifi_tune.sh
 bash pi_wifi_tune.sh
 ```
 

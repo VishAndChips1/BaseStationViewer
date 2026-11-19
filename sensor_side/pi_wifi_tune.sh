@@ -7,7 +7,7 @@
 # normal user (not root):
 #
 #     curl -4 -fL --connect-timeout 10 --max-time 60 -o pi_wifi_tune.sh \
-#         https://raw.githubusercontent.com/VishAndChips1/GroundStation3D/main/sensor_side/pi_wifi_tune.sh
+#         https://raw.githubusercontent.com/VishAndChips1/BaseStationViewer/main/sensor_side/pi_wifi_tune.sh
 #     bash pi_wifi_tune.sh
 #
 # It changes ONE thing (WiFi power-save) and nothing else: it does not touch the
